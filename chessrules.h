@@ -372,6 +372,7 @@ public:
 	}
 
 	bool CanUndo() const		{ return !history.empty(); }
+	int Ply() const			{ return (int)history.size(); }	// moves made since the start/FEN
 	const Move* LastMove() const	{ return history.empty() ? nullptr : &history.back().move; }
 
 	GameStatus Status()

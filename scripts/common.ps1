@@ -21,6 +21,8 @@ function Get-MSBuild {
 # Runs a command line inside the x64 developer environment (cl.exe on PATH).
 function Invoke-DevCmd([string]$CommandLine) {
     $vcvars = Join-Path (Get-VsPath) 'VC\Auxiliary\Build\vcvars64.bat'
-    cmd /c "call `"$vcvars`" >nul && $CommandLine"
+    # vcvars itself calls vswhere by name; put it on PATH so it doesn't print a "not recognized" warning
+    $installer = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
+    cmd /c "set `"PATH=$installer;%PATH%`" && call `"$vcvars`" >nul && $CommandLine"
     if ($LASTEXITCODE -ne 0) { throw "Command failed ($LASTEXITCODE): $CommandLine" }
 }

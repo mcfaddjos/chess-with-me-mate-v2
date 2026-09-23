@@ -21,6 +21,11 @@ try {
     Invoke-DevCmd "cl /nologo /O2 /EHsc /std:c++17 /W4 /WX perft.cpp /Fe:build\perft.exe /Fo:build\ >nul"
     & (Join-Path $buildDir 'perft.exe')
     if ($LASTEXITCODE -ne 0) { throw 'Rules tests failed' }
+
+    Write-Host '== engine tests'
+    Invoke-DevCmd "cl /nologo /O2 /EHsc /std:c++17 /W4 /WX engine_tests.cpp /Fe:build\engine_tests.exe /Fo:build\ >nul"
+    & (Join-Path $buildDir 'engine_tests.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'Engine tests failed' }
 }
 finally { Pop-Location }
 

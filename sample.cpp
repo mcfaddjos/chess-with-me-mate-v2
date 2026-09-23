@@ -977,6 +977,8 @@ void PlayMove(const Move& m)
 	Rules.MakeMove(m);
 	SelectedSq = -1;
 	PendingPromoFrom = PendingPromoTo = -1;
+	if (!VsComputer() || moverSide == HumanSide)
+		RatingNote.clear();		// last game's rating change has been seen
 	RefreshGameState();
 	PressClock(moverSide);
 	StartAnimating();
@@ -1215,8 +1217,7 @@ void StartNewGame(const char* fen)
 	PendingPromoFrom = PendingPromoTo = -1;
 	ResignedSide = -1;
 	ResultRecorded = false;
-	RatingNote.clear();
-	ResetClock();
+	ResetClock();		// (RatingNote stays up until you move, so a rating change from leaving a game is seen)
 
 	if (VsComputer())
 	{

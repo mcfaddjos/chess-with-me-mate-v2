@@ -29,6 +29,13 @@
 #include <glm/gtc/type_ptr.hpp>
 
 #include "chessrules.h"
+#include "engine.h"
+#include <thread>
+#include <atomic>
+#include <fstream>
+#ifdef WIN32
+#include <direct.h>		// _mkdir
+#endif
 
 // CS 450 / 550 --Fall Quarter 2023
 // Final Project -- Chess With Me Mate?
@@ -63,6 +70,12 @@ void	Resize(int, int);
 void	Visibility(int);
 void	SyncPiecesToBoard();
 void	RefreshGameState();
+void	LoadProfile();
+void	StartNewGame(const char*);
+void	StartBot();
+void	StopBot();
+void	RecordResultIfOver();
+void	SetView(int);
 
 void	Axes(float);
 void	Cross(float[3], float[3], float[3]);
@@ -201,7 +214,22 @@ enum ButtonVals
 	RESET,
 	QUIT,
 	NEW_GAME,
-	UNDO
+	UNDO,
+	RESIGN
+};
+
+// who you play against, and which color you get:
+enum Opponents
+{
+	OPPONENT_COMPUTER,
+	OPPONENT_HUMAN
+};
+
+enum ColorChoices
+{
+	COLOR_ALTERNATE,
+	COLOR_WHITE,
+	COLOR_BLACK
 };
 
 // camera presets:
@@ -323,7 +351,10 @@ int		TimeControlNow = 0;
 bool	ShowHints = true;
 bool	AutoFlip = false;
 bool	ChoosePromotion = false;
-int		TimeMenu, HintsMenu, FlipMenu, PromoMenu;	// glut menu ids, relabeled to mark the current choice
+int		Opponent = OPPONENT_COMPUTER;
+int		ColorChoice = COLOR_ALTERNATE;
+int		TimeMenu, HintsMenu, FlipMenu, PromoMenu, OpponentMenu, ColorMenu;	// glut menu ids, relabeled to mark the current choice
+int		StartClockSeconds = 0;	// -clock N (testing): overrides the time control's starting time
 
 // the chess clock:
 int		ClockMs[2];			// time left, indexed by SIDE_WHITE / SIDE_BLACK
@@ -335,6 +366,30 @@ std::string ClockShown;		// last clock text drawn, to redraw only when it change
 
 // a pawn reached the last rank and we're waiting for 1-4 to pick the piece:
 int		PendingPromoFrom = -1, PendingPromoTo = -1;
+
+// the computer opponent -- searches on a worker thread so the window stays responsive:
+struct Profile
+{
+	int rating = RATING_START;
+	int games = 0, wins = 0, losses = 0, draws = 0;
+};
+Profile	Player;
+std::string ProfilePath;		// where Player is saved between sessions
+int		HumanSide = SIDE_WHITE;	// in a computer game, which side you play
+int		BotElo = RATING_START;	// this game's bot rating
+int		FixedBotElo = 0;		// -botelo N (testing): pin the bot's rating instead of adapting
+unsigned BotSeed = 0;			// -seed N (testing): repeatable bot moves; 0 = random
+bool	ResultRecorded;			// this game's result already went into Player
+int		ResignedSide = -1;		// side that resigned, or -1
+std::string RatingNote;			// e.g. "RATING 1000 -> 1016 (+16)" after a game
+
+std::thread BotThread;
+std::atomic<bool> BotStop(false);
+std::atomic<bool> BotDone(false);
+Move	BotResult;
+bool	BotThinking;
+int		BotGeneration;			// bumped whenever a search is abandoned, so stale results are ignored
+int		BotStartMs;
 
 // last pick ray, drawn in debug mode:
 glm::vec3 RayOrigin, RayDir;
@@ -406,38 +461,64 @@ main( int argc, char *argv[ ] )
 
 	Reset( );
 
-	// command line (handy for testing):
-	//   -d          debug mode (pick ray, boxes, click/move log on stderr)
-	//   -fen "..."  start from a position instead of the opening setup
-	//   -tc N       time control N from the Game Options list (0 = untimed)
+	// command line (mostly for testing):
+	//   -d               debug mode (pick ray, boxes, click/move log on stderr)
+	//   -fen "..."       start from a position instead of the opening setup
+	//   -tc N            time control N from the Game Options list (0 = untimed)
+	//   -clock S         start each clock at S seconds (short games for testing)
+	//   -human | -bot    two players on one screen, or play the computer (default)
+	//   -color white|black   your color against the computer (default: alternate)
+	//   -botelo N        fix the bot's rating instead of adapting it
+	//   -seed N          repeatable bot moves
+	//   -profile PATH    where your rating is kept (default %APPDATA%\ChessWithMeMate\profile.txt)
+	//   -cam YAW,PITCH   start the camera here (degrees)
+	//   -choosepromo -autoflip -nohints   the matching Game Options
 	const char* startFen = nullptr;
+	const char* startCam = nullptr;
 	for( int i = 1; i < argc; i++ )
 	{
-		if( strcmp( argv[i], "-d" ) == 0 )
-			DebugOn = 1;
-		else if( strcmp( argv[i], "-fen" ) == 0 && i + 1 < argc )
-			startFen = argv[++i];
-		else if( strcmp( argv[i], "-tc" ) == 0 && i + 1 < argc )
-			TimeControlNow = glm::clamp( atoi( argv[++i] ), 0, NUM_TIME_CONTROLS - 1 );
+		std::string a = argv[i];
+		bool more = i + 1 < argc;
+		if( a == "-d" )						DebugOn = 1;
+		else if( a == "-fen" && more )		startFen = argv[++i];
+		else if( a == "-tc" && more )		TimeControlNow = glm::clamp( atoi( argv[++i] ), 0, NUM_TIME_CONTROLS - 1 );
+		else if( a == "-clock" && more )	StartClockSeconds = std::max( 1, atoi( argv[++i] ) );
+		else if( a == "-human" )			Opponent = OPPONENT_HUMAN;
+		else if( a == "-bot" )				Opponent = OPPONENT_COMPUTER;
+		else if( a == "-color" && more )	{ std::string c = argv[++i]; ColorChoice = ( c == "black" ) ? COLOR_BLACK : ( c == "white" ) ? COLOR_WHITE : COLOR_ALTERNATE; }
+		else if( a == "-botelo" && more )	FixedBotElo = glm::clamp( atoi( argv[++i] ), RATING_MIN, RATING_MAX );
+		else if( a == "-seed" && more )		BotSeed = (unsigned)atoi( argv[++i] );
+		else if( a == "-profile" && more )	ProfilePath = argv[++i];
+		else if( a == "-cam" && more )		startCam = argv[++i];
+		else if( a == "-choosepromo" )		ChoosePromotion = true;
+		else if( a == "-autoflip" )			AutoFlip = true;
+		else if( a == "-nohints" )			ShowHints = false;
+		else
+			fprintf( stderr, "Unknown option '%s'\n", argv[i] );
 	}
 
 	// create the display lists that **will not change**:
 
 	InitLists( );
 
+	// your rating, from last time:
+
+	LoadProfile( );
+
 	// set up a new game:
 
-	DoMainMenu( NEW_GAME );
-	if( startFen != nullptr )
+	StartNewGame( startFen );
+
+	float yaw, pitch;
+	if( startCam != nullptr && sscanf( startCam, "%f,%f", &yaw, &pitch ) == 2 )
 	{
-		if( !Rules.LoadFEN( startFen ) )
-		{
-			fprintf( stderr, "Bad -fen position, using the normal setup\n" );
-			Rules.Reset( );
-		}
-		SyncPiecesToBoard( );
-		RefreshGameState( );
+		CamYaw = yaw;
+		CamPitch = glm::clamp( pitch, CAM_PITCH_MIN, CAM_PITCH_MAX );
 	}
+
+	// make sure a search thread is stopped before the program exits (closing the window
+	// exits from inside glut, and a still-running std::thread would abort the process):
+	atexit( []( ) { StopBot( ); } );
 
 	// setup all the user interface stuff:
 
@@ -467,7 +548,7 @@ glm::vec3 SquareCenter(int sq)
 
 bool IsGameOver()
 {
-	return FlagSide >= 0 || Status == STATUS_CHECKMATE || Status == STATUS_STALEMATE ||
+	return FlagSide >= 0 || ResignedSide >= 0 || Status == STATUS_CHECKMATE || Status == STATUS_STALEMATE ||
 		Status == STATUS_DRAW_FIFTY || Status == STATUS_DRAW_MATERIAL;
 }
 
@@ -560,11 +641,21 @@ void RefreshGameState()
 		ClockRunning = false;
 }
 
-// turn the board to face whoever is to move (Auto-Flip option)
+bool VsComputer()
+{
+	return Opponent == OPPONENT_COMPUTER;
+}
+
+// turn the board to face whoever is to move (Auto-Flip option, two-player games only --
+// against the computer the board stays on your side)
 void ApplyAutoFlip()
 {
-	if (AutoFlip)
-		CamYaw = (Rules.side == SIDE_WHITE) ? 0.f : 180.f;
+	if (!AutoFlip || VsComputer())
+		return;
+	float yaw = (Rules.side == SIDE_WHITE) ? 0.f : 180.f;
+	if (yaw != CamYaw && DebugOn != 0)
+		fprintf(stderr, "view: %s side\n", Rules.side == SIDE_WHITE ? "white" : "black");
+	CamYaw = yaw;
 }
 
 // snap every on-screen piece to match Rules.board (new game, undo)
@@ -614,7 +705,8 @@ std::string FormatClock(int ms)
 
 void ResetClock()
 {
-	ClockMs[SIDE_WHITE] = ClockMs[SIDE_BLACK] = TimeControls[TimeControlNow].minutes * 60 * 1000;
+	int ms = (StartClockSeconds > 0) ? StartClockSeconds * 1000 : TimeControls[TimeControlNow].minutes * 60 * 1000;
+	ClockMs[SIDE_WHITE] = ClockMs[SIDE_BLACK] = ms;
 	ClockRunning = false;
 	ClockPaused = false;
 	FlagSide = -1;
@@ -635,6 +727,10 @@ void UpdateClock()
 			FlagSide = Rules.side;
 			ClockRunning = false;
 			SelectedSq = -1;
+			if (DebugOn != 0)
+				fprintf(stderr, "time out: %s\n", FlagSide == SIDE_WHITE ? "white" : "black");
+			StopBot();
+			RecordResultIfOver();
 		}
 	}
 	ClockLastMs = now;
@@ -845,7 +941,7 @@ void PlayMove(const Move& m)
 	{
 		UpdateClock();
 		if (FlagSide >= 0)
-			return;
+			return;		// UpdateClock already recorded the result
 	}
 	int moverSide = Rules.side;
 
@@ -886,7 +982,10 @@ void PlayMove(const Move& m)
 	StartAnimating();
 
 	if (DebugOn != 0)
-		fprintf(stderr, "%s\n", LastMoveText.c_str());
+		fprintf(stderr, "%s%s\n", (VsComputer() && moverSide != HumanSide) ? "bot: " : "", LastMoveText.c_str());
+
+	RecordResultIfOver();
+	StartBot();		// no-op unless it's now the computer's turn
 }
 
 void HandleClick(int sq)
@@ -896,6 +995,8 @@ void HandleClick(int sq)
 
 	if (IsGameOver() || ClockPaused)
 		return;
+	if (VsComputer() && Rules.side != HumanSide)
+		return;		// the computer is thinking
 
 	// a click anywhere cancels a pending promotion choice:
 	PendingPromoFrom = PendingPromoTo = -1;
@@ -940,6 +1041,199 @@ void ChoosePromotionPiece(int type)
 			return;
 		}
 	}
+}
+
+#pragma endregion
+
+#pragma region Computer Opponent
+
+std::string DefaultProfilePath()
+{
+#ifdef WIN32
+	const char* appdata = getenv("APPDATA");
+	if (appdata != nullptr)
+	{
+		std::string dir = std::string(appdata) + "\\ChessWithMeMate";
+		_mkdir(dir.c_str());	// fine if it already exists
+		return dir + "\\profile.txt";
+	}
+#endif
+	return "profile.txt";
+}
+
+// profile.txt is plain "key value" lines, e.g. "rating 1016"
+void LoadProfile()
+{
+	if (ProfilePath.empty())
+		ProfilePath = DefaultProfilePath();
+	std::ifstream in(ProfilePath);
+	std::string key;
+	int value;
+	while (in >> key >> value)
+	{
+		if (key == "rating")		Player.rating = glm::clamp(value, RATING_MIN, RATING_MAX);
+		else if (key == "games")	Player.games = std::max(0, value);
+		else if (key == "wins")		Player.wins = std::max(0, value);
+		else if (key == "losses")	Player.losses = std::max(0, value);
+		else if (key == "draws")	Player.draws = std::max(0, value);
+	}
+}
+
+void SaveProfile()
+{
+	std::ofstream out(ProfilePath);
+	out << "rating " << Player.rating << "\n"
+		<< "games " << Player.games << "\n"
+		<< "wins " << Player.wins << "\n"
+		<< "losses " << Player.losses << "\n"
+		<< "draws " << Player.draws << "\n";
+	if (!out)
+		fprintf(stderr, "Could not save profile to %s\n", ProfilePath.c_str());
+}
+
+// once a computer game ends: update your rating (standard Elo) and save it
+void RecordResultIfOver()
+{
+	if (!VsComputer() || ResultRecorded || !IsGameOver())
+		return;
+	ResultRecorded = true;
+
+	double score;	// yours: 1 win, 0.5 draw, 0 loss
+	if (ResignedSide >= 0)
+		score = (ResignedSide == HumanSide) ? 0.0 : 1.0;
+	else if (FlagSide >= 0)
+		score = !HasMatingMaterial(FlagSide ^ 1) ? 0.5 : (FlagSide == HumanSide) ? 0.0 : 1.0;
+	else if (Status == STATUS_CHECKMATE)
+		score = (Rules.side == HumanSide) ? 0.0 : 1.0;	// the side to move is the one mated
+	else
+		score = 0.5;
+
+	int before = Player.rating;
+	Player.rating = AdjustRating(before, BotElo, score, Player.games);
+	Player.games++;
+	if (score == 1.0)		Player.wins++;
+	else if (score == 0.0)	Player.losses++;
+	else					Player.draws++;
+	SaveProfile();
+
+	char buf[64];
+	sprintf(buf, "RATING %d -> %d (%+d)", before, Player.rating, Player.rating - before);
+	RatingNote = buf;
+	if (DebugOn != 0)
+		fprintf(stderr, "result: %s, %s\n", score == 1.0 ? "win" : score == 0.0 ? "loss" : "draw", buf);
+}
+
+void StopBot()
+{
+	if (BotThread.joinable())
+	{
+		BotStop = true;		// the search checks this and bails out quickly
+		BotThread.join();
+	}
+	BotStop = false;
+	BotDone = false;
+	BotThinking = false;
+	BotGeneration++;
+}
+
+const int BOT_MIN_THINK_MS = 600;	// even an instant answer waits a beat, so moves don't blur together
+
+// checks 20x a second for the computer's move; plays it once the board is still
+void BotPoll(int generation)
+{
+	if (generation != BotGeneration || !BotThinking)
+		return;
+	if (IsGameOver())
+	{
+		StopBot();
+		return;
+	}
+	bool ready = BotDone && !Animating && !ClockPaused &&
+		glutGet(GLUT_ELAPSED_TIME) - BotStartMs >= BOT_MIN_THINK_MS;
+	if (!ready)
+	{
+		glutTimerFunc(50, BotPoll, generation);
+		return;
+	}
+	BotThread.join();
+	BotThinking = false;
+	Move m = BotResult;
+	if (m.from != m.to)
+		PlayMove(m);
+}
+
+void StartBot()
+{
+	if (!VsComputer() || Rules.side == HumanSide || IsGameOver() || BotThinking)
+		return;
+	StopBot();		// joins a finished thread, if one is left over
+
+	BotLevel level = LevelForElo(BotElo);
+	if (IsTimed())		// don't let the computer burn more than a small slice of its clock
+		level.thinkSeconds = std::min(level.thinkSeconds, ClockMs[Rules.side] / 1000.0 / 30.0 + 0.05);
+	unsigned seed = BotSeed != 0 ? BotSeed + (unsigned)Rules.Ply() : std::random_device{}();
+
+	BotThinking = true;
+	BotDone = false;
+	BotStartMs = glutGet(GLUT_ELAPSED_TIME);
+	ChessRules position = Rules;	// the thread gets its own copy
+	BotThread = std::thread([position, level, seed]()
+	{
+		Engine engine;
+		BotResult = engine.Choose(position, level, BotStop, seed);
+		BotDone = true;
+	});
+	glutTimerFunc(50, BotPoll, BotGeneration);
+}
+
+// walking away from a computer game you've already played a couple of moves in counts as
+// resigning it -- otherwise abandoning lost games would keep your rating artificially high
+void LeaveCurrentGame()
+{
+	StopBot();
+	if (VsComputer() && !ResultRecorded && !IsGameOver() && Rules.Ply() >= 3)
+	{
+		ResignedSide = HumanSide;
+		if (DebugOn != 0)
+			fprintf(stderr, "left an unfinished game: counted as resigning\n");
+		RecordResultIfOver();
+	}
+}
+
+void StartNewGame(const char* fen)
+{
+	LeaveCurrentGame();
+	FinishAnimations();
+	Rules.Reset();
+	if (fen != nullptr && !Rules.LoadFEN(fen))
+	{
+		fprintf(stderr, "Bad -fen position, using the normal setup\n");
+		Rules.Reset();
+	}
+	SyncPiecesToBoard();
+	SelectedSq = -1;
+	PendingPromoFrom = PendingPromoTo = -1;
+	ResignedSide = -1;
+	ResultRecorded = false;
+	RatingNote.clear();
+	ResetClock();
+
+	if (VsComputer())
+	{
+		if (ColorChoice == COLOR_WHITE)			HumanSide = SIDE_WHITE;
+		else if (ColorChoice == COLOR_BLACK)	HumanSide = SIDE_BLACK;
+		else HumanSide = (Player.games % 2 == 0) ? SIDE_WHITE : SIDE_BLACK;	// alternate
+		BotElo = (FixedBotElo != 0) ? FixedBotElo : BotRatingFor(Player.rating);
+		SetView(HumanSide == SIDE_WHITE ? VIEW_WHITE : VIEW_BLACK);
+		if (DebugOn != 0)
+			fprintf(stderr, "--- new game vs bot %d, you play %s ---\n", BotElo, HumanSide == SIDE_WHITE ? "white" : "black");
+	}
+	else if (DebugOn != 0)
+		fprintf(stderr, "--- new game ---\n");
+
+	RefreshGameState();
+	ApplyAutoFlip();
+	StartBot();
 }
 
 #pragma endregion
@@ -1188,9 +1482,13 @@ void DrawHighlights()
 	const Move* last = Rules.LastMove();
 	if (last != nullptr)
 	{
+		// a tint reads well on light squares; the bright frame makes it show on dark ones too
 		glColor4f(0.85f, 0.65f, 0.15f, 0.45f);
 		SquareQuad(last->from, 1.f);
 		SquareQuad(last->to, 1.f);
+		glColor4f(1.f, 0.8f, 0.25f, 0.95f);
+		SquareFrame(last->from, 0.08f);
+		SquareFrame(last->to, 0.08f);
 	}
 
 	if (Status == STATUS_CHECK || Status == STATUS_CHECKMATE)
@@ -1326,36 +1624,72 @@ void DrawHud()
 	glMatrixMode(GL_MODELVIEW);
 	glLoadIdentity();
 
-	std::string mover = (Rules.side == SIDE_WHITE) ? "WHITE" : "BLACK";
-	std::string other = (Rules.side == SIDE_WHITE) ? "BLACK" : "WHITE";
+	// against the computer, talk about "you" and "the bot" instead of white and black:
+	bool bot = VsComputer();
+	auto Name = [bot](int s) -> std::string
+	{
+		if (bot)
+			return (s == HumanSide) ? "YOU" : "BOT";
+		return (s == SIDE_WHITE) ? "WHITE" : "BLACK";
+	};
+	auto Wins = [bot, Name](int s) -> std::string
+	{
+		return (bot && s == HumanSide) ? "YOU WIN" : Name(s) + " WINS";
+	};
+	std::string toMove = bot ? (Rules.side == HumanSide ? "YOUR MOVE" : "BOT THINKING...") : Name(Rules.side) + " TO MOVE";
+
 	std::string line;
 	float r = 1.f, g = 1.f, b = 1.f;
 	switch (Status)
 	{
-	case STATUS_PLAYING:		line = mover + " TO MOVE"; break;
-	case STATUS_CHECK:			line = mover + " TO MOVE - CHECK!"; r = 1.f; g = 0.35f; b = 0.3f; break;
-	case STATUS_CHECKMATE:		line = "CHECKMATE - " + other + " WINS   [N] NEW GAME"; r = 1.f; g = 0.85f; b = 0.1f; break;
+	case STATUS_PLAYING:		line = toMove; break;
+	case STATUS_CHECK:			line = toMove + " - CHECK!"; r = 1.f; g = 0.35f; b = 0.3f; break;
+	case STATUS_CHECKMATE:		line = "CHECKMATE - " + Wins(Rules.side ^ 1) + "   [N] NEW GAME"; r = 1.f; g = 0.85f; b = 0.1f; break;
 	case STATUS_STALEMATE:		line = "STALEMATE - DRAW   [N] NEW GAME"; r = 0.6f; g = 0.9f; b = 1.f; break;
 	case STATUS_DRAW_FIFTY:		line = "DRAW - FIFTY MOVE RULE   [N] NEW GAME"; r = 0.6f; g = 0.9f; b = 1.f; break;
 	case STATUS_DRAW_MATERIAL:	line = "DRAW - NOT ENOUGH MATERIAL   [N] NEW GAME"; r = 0.6f; g = 0.9f; b = 1.f; break;
 	}
 	if (FlagSide >= 0)
 	{
-		std::string flagged = (FlagSide == SIDE_WHITE) ? "WHITE" : "BLACK";
-		std::string winner = (FlagSide == SIDE_WHITE) ? "BLACK" : "WHITE";
 		if (HasMatingMaterial(FlagSide ^ 1))
-			line = flagged + " OUT OF TIME - " + winner + " WINS";
+			line = Name(FlagSide) + " OUT OF TIME - " + Wins(FlagSide ^ 1);
 		else
-			line = flagged + " OUT OF TIME - DRAW";
+			line = Name(FlagSide) + " OUT OF TIME - DRAW";
+		r = 1.f; g = 0.85f; b = 0.1f;
+	}
+	if (ResignedSide >= 0)
+	{
+		line = Name(ResignedSide) + " RESIGNED - " + Wins(ResignedSide ^ 1) + "   [N] NEW GAME";
 		r = 1.f; g = 0.85f; b = 0.1f;
 	}
 	HudText(2.f, 96.f, line, r, g, b);
 
+	// the bot's level, in US Chess terms, and yours:
+	if (bot)
+	{
+		char buf[96];
+		sprintf(buf, "BOT %d %s   YOU %d %s", BotElo, RatingClass(BotElo), Player.rating, RatingClass(Player.rating));
+		HudText(2.f, 92.5f, buf, 0.6f, 0.9f, 1.f);
+	}
+
+	float y = bot ? 89.f : 92.5f;
 	if (!LastMoveText.empty())
-		HudText(2.f, 92.5f, "LAST: " + LastMoveText, 0.85f, 0.85f, 0.85f);
+	{
+		HudText(2.f, y, "LAST: " + LastMoveText, 0.85f, 0.85f, 0.85f);
+		y -= 3.5f;
+	}
+
+	if (!RatingNote.empty())
+	{
+		HudText(2.f, y, RatingNote, 1.f, 0.85f, 0.1f);
+		y -= 3.5f;
+	}
 
 	if (PendingPromoTo >= 0)
-		HudText(2.f, 89.f, "PROMOTE TO: [1] QUEEN [2] ROOK [3] BISHOP [4] KNIGHT", 1.f, 0.85f, 0.1f);
+	{
+		HudText(2.f, y, "PROMOTE TO: [1] QUEEN [2] ROOK [3] BISHOP [4] KNIGHT", 1.f, 0.85f, 0.1f);
+		y -= 3.5f;
+	}
 
 	// clocks, top right -- the side to move is bright, under 10 seconds turns red:
 	if (IsTimed())
@@ -1376,7 +1710,7 @@ void DrawHud()
 	}
 
 	if (Frozen)
-		HudText(2.f, 85.5f, "ANIMATION FROZEN [F]", 0.6f, 0.9f, 1.f);
+		HudText(2.f, y, "ANIMATION FROZEN [F]", 0.6f, 0.9f, 1.f);
 
 	if (IsTimed())
 		HudText(2.f, 2.f, "[N]EW [P]AUSE [V]IEW  SHIFT+DRAG/ARROWS ORBIT  WHEEL ZOOM", 0.75f, 0.75f, 0.75f);
@@ -1514,31 +1848,45 @@ DoMainMenu( int id )
 			break;
 
 		case NEW_GAME:
-			if( DebugOn != 0 )
-				fprintf( stderr, "--- new game ---\n" );
-			FinishAnimations( );
-			Rules.Reset( );
-			SyncPiecesToBoard( );
-			SelectedSq = -1;
-			PendingPromoFrom = PendingPromoTo = -1;
-			ResetClock( );
-			RefreshGameState( );
-			ApplyAutoFlip( );
+			StartNewGame( nullptr );
 			break;
 
 		case UNDO:
-			// no take-backs against the clock:
+		{
+			// no take-backs against the clock, or once a game is over:
 			FinishAnimations( );
-			if( Rules.CanUndo( ) && !IsTimed( ) )
+			if( IsTimed( ) || IsGameOver( ) || !Rules.CanUndo( ) )
+				break;
+			StopBot( );
+			// against the computer, go back to your last turn (its reply too, if it made one):
+			int plies = 1;
+			if( VsComputer( ) && Rules.side == HumanSide && Rules.Ply( ) >= 2 )
+				plies = 2;
+			for( int i = 0; i < plies && Rules.CanUndo( ); i++ )
 			{
 				if( DebugOn != 0 )
 					fprintf( stderr, "undo %s\n", LastMoveText.c_str( ) );
 				Rules.UnmakeMove( );
-				SyncPiecesToBoard( );
-				SelectedSq = -1;
-				PendingPromoFrom = PendingPromoTo = -1;
 				RefreshGameState( );
-				ApplyAutoFlip( );
+			}
+			SyncPiecesToBoard( );
+			SelectedSq = -1;
+			PendingPromoFrom = PendingPromoTo = -1;
+			ApplyAutoFlip( );
+			StartBot( );	// e.g. undone back to the start with the computer playing white
+			break;
+		}
+
+		case RESIGN:
+			if( !IsGameOver( ) )
+			{
+				StopBot( );
+				ResignedSide = VsComputer( ) ? HumanSide : Rules.side;
+				ClockRunning = false;
+				SelectedSq = -1;
+				if( DebugOn != 0 )
+					fprintf( stderr, "resign: %s\n", ResignedSide == SIDE_WHITE ? "white" : "black" );
+				RecordResultIfOver( );
 			}
 			break;
 
@@ -1546,6 +1894,7 @@ DoMainMenu( int id )
 			// gracefully close out the graphics:
 			// gracefully close the graphics window:
 			// gracefully exit the program:
+			StopBot( );
 			glutSetWindow( MainWindow );
 			glFinish( );
 			glutDestroyWindow( MainWindow );
@@ -1607,6 +1956,15 @@ RefreshOptionMenus( )
 	glutChangeToMenuEntry( 1, MenuLabel( "Always Queen", !ChoosePromotion ).c_str( ), 0 );
 	glutChangeToMenuEntry( 2, MenuLabel( "Choose (1-4)",  ChoosePromotion ).c_str( ), 1 );
 
+	glutSetMenu( OpponentMenu );
+	glutChangeToMenuEntry( 1, MenuLabel( "Computer (adapts to you)", Opponent == OPPONENT_COMPUTER ).c_str( ), OPPONENT_COMPUTER );
+	glutChangeToMenuEntry( 2, MenuLabel( "Two Players",              Opponent == OPPONENT_HUMAN ).c_str( ),    OPPONENT_HUMAN );
+
+	glutSetMenu( ColorMenu );
+	glutChangeToMenuEntry( 1, MenuLabel( "Alternate", ColorChoice == COLOR_ALTERNATE ).c_str( ), COLOR_ALTERNATE );
+	glutChangeToMenuEntry( 2, MenuLabel( "White",     ColorChoice == COLOR_WHITE ).c_str( ),     COLOR_WHITE );
+	glutChangeToMenuEntry( 3, MenuLabel( "Black",     ColorChoice == COLOR_BLACK ).c_str( ),     COLOR_BLACK );
+
 	if( was != 0 )
 		glutSetMenu( was );
 }
@@ -1644,6 +2002,32 @@ DoPromoMenu( int id )
 {
 	ChoosePromotion = ( id != 0 );
 	RefreshOptionMenus( );
+}
+
+// switching opponent or color starts a new game:
+void
+DoOpponentMenu( int id )
+{
+	if( id == Opponent )
+		return;
+	LeaveCurrentGame( );		// while Opponent still says what kind of game it was
+	Opponent = id;
+	RefreshOptionMenus( );
+	StartNewGame( nullptr );
+	glutSetWindow( MainWindow );
+	glutPostRedisplay( );
+}
+
+void
+DoYourColorMenu( int id )
+{
+	if( id == ColorChoice )
+		return;
+	ColorChoice = id;
+	RefreshOptionMenus( );
+	StartNewGame( nullptr );
+	glutSetWindow( MainWindow );
+	glutPostRedisplay( );
 }
 
 #pragma endregion
@@ -1717,7 +2101,18 @@ InitMenus( )
 	glutAddMenuEntry( "Always Queen", 0 );
 	glutAddMenuEntry( "Choose (1-4)", 1 );
 
+	OpponentMenu = glutCreateMenu( DoOpponentMenu );
+	glutAddMenuEntry( "Computer (adapts to you)", OPPONENT_COMPUTER );
+	glutAddMenuEntry( "Two Players",              OPPONENT_HUMAN );
+
+	ColorMenu = glutCreateMenu( DoYourColorMenu );
+	glutAddMenuEntry( "Alternate", COLOR_ALTERNATE );
+	glutAddMenuEntry( "White",     COLOR_WHITE );
+	glutAddMenuEntry( "Black",     COLOR_BLACK );
+
 	int optionsmenu = glutCreateMenu( DoMainMenu );
+	glutAddSubMenu( "Opponent",        OpponentMenu );
+	glutAddSubMenu( "Your Color",      ColorMenu );
 	glutAddSubMenu( "Time Control",    TimeMenu );
 	glutAddSubMenu( "Move Hints",      HintsMenu );
 	glutAddSubMenu( "Auto-Flip Board", FlipMenu );
@@ -1726,6 +2121,7 @@ InitMenus( )
 	int mainmenu = glutCreateMenu( DoMainMenu );
 	glutAddMenuEntry( "New Game",      NEW_GAME );
 	glutAddMenuEntry( "Undo Move",     UNDO );
+	glutAddMenuEntry( "Resign",        RESIGN );
 	glutAddSubMenu(   "Game Options",  optionsmenu );
 	glutAddSubMenu(   "View",          viewmenu );
 	glutAddSubMenu(   "Projection",    projmenu );
@@ -2065,7 +2461,7 @@ Reset( )
 	NowProjection = PERSP;
 	LightColorNow = LIGHT_WHITE;
 	isSpotLight = false;
-	SetView( VIEW_WHITE );
+	SetView( ( VsComputer( ) && HumanSide == SIDE_BLACK ) ? VIEW_BLACK : VIEW_WHITE );
 }
 
 // called when user resizes the window:

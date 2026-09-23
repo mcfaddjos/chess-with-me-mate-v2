@@ -1,0 +1,29 @@
+name: CI
+
+# Every push and pull request: build both configurations and run the rules tests.
+# (The UI tests need a real desktop and are run locally with .\scripts\test.ps1 -UI.)
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Debug
+        shell: pwsh
+        run: .\scripts\build.ps1 -Configuration Debug
+
+      - name: Build Release
+        shell: pwsh
+        run: .\scripts\build.ps1 -Configuration Release
+
+      - name: Rules tests
+        shell: pwsh
+        run: .\scripts\test.ps1

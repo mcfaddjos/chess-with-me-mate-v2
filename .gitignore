@@ -19,3 +19,7 @@ x64/
 /sample
 *.exe
 *.o
+
+# script output
+dist/
+tests/build/

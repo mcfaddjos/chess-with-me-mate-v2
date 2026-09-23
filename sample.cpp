@@ -3,11 +3,10 @@
 #include <ctype.h>
 #include <string>
 #include <vector>
-#include <iostream>
+#include <algorithm>
 
 #define _USE_MATH_DEFINES
 #include <math.h>
-#include <glm/gtc/matrix_transform.hpp>
 
 #ifndef F_PI
 #define F_PI		((float)(M_PI))
@@ -25,15 +24,15 @@
 #include <GL/gl.h>
 #include <GL/glu.h>
 #include "glut.h"
-#include <algorithm>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+#include "chessrules.h"
+
 // CS 450 / 550 --Fall Quarter 2023
-// 100 Points
-// Due : December Somethingth
-// Final Project
+// Final Project -- Chess With Me Mate?
+// v2: real chess rules, orbit camera, time-based animation, redraw-on-demand
 
 // Author:			Joseph McFadden
 
@@ -45,42 +44,33 @@ void	Animate();
 void	Display();
 void	DoAxesMenu(int);
 void	DoColorMenu(int);
-void	DoDepthBufferMenu(int);
-void	DoDepthFightingMenu(int);
 void	DoDepthMenu(int);
 void	DoDebugMenu(int);
 void	DoMainMenu(int);
 void	DoProjectMenu(int);
+void	DoViewMenu(int);
 void	DoRasterString(float, float, float, char*);
-void	DoStrokeString(float, float, float, float, char*);
-float	ElapsedSeconds();
 void	InitGraphics();
-void	InitChessBoard();
 void	InitLists();
 void	InitMenus();
 void	Keyboard(unsigned char, int, int);
+void	SpecialKeys(int, int, int);
 void	MouseButton(int, int, int, int);
 void	MouseMotion(int, int);
+void	MousePassive(int, int);
 void	Reset();
 void	Resize(int, int);
 void	Visibility(int);
-void	RenderRay();
+void	SyncPiecesToBoard();
+void	RefreshGameState();
 
-char*   ToChar(const char*);
 void	Axes(float);
-void	HsvRgb(float[3], float[3]);
 void	Cross(float[3], float[3], float[3]);
-float	Dot(float[3], float[3]);
 float	Unit(float[3], float[3]);
-float	Unit(float[3]);
-float*  Array3(float, float, float);
-float*  MulArray3(float, float, float, float);
-float*  MulArray3(float, float[]);
-bool	AreVec3Equal(const glm::vec3&, const glm::vec3&, float = 0.001f);
-float	GetFallingTime(float);
+float*	Array3(float, float, float);
+float*	MulArray3(float, float, float, float);
+float*	MulArray3(float, float[]);
 
-struct	BoundingBox;
-struct	Piece;
 #pragma endregion
 
 #pragma region Colors
@@ -95,8 +85,6 @@ const float	WHITE[] = { 1.,1.,1.,1. };
 // the color numbers:
 // this order must match the radio button order, which must match the order of the color names,
 // 	which must match the order of the color RGB values
-
-
 
 char* ColorNames[] =
 {
@@ -123,36 +111,32 @@ const GLfloat Colors[][3] =
 	{ 1.,1.,1. }		// white
 };
 
+enum ColorIndex
+{
+	RED,
+	YELLOW,
+	GREEN,
+	CYAN,
+	BLUE,
+	MAGENTA,
+	LIGHT_WHITE
+};
+
 #pragma endregion
 
 #pragma region IncludedFiles
 
-// these are here for when you need them -- just uncomment the ones you need:
 #include "setmaterial.cpp"
 #include "setlight.cpp"
-#include "osusphere.cpp"
-#include "bmptotexture.cpp"
 #include "loadobjfile.cpp"
-
 #include "keytime.cpp"
-#include <stdexcept>
-
-//#include "osucone.cpp"
-//#include "osutorus.cpp"
-//#include "glslprogram.cpp"
-//#include "CarouselHorse0.10.550.cpp"
 
 #pragma endregion
 
 #pragma region Constant Global Variables
 
-// title of these windows:
-const char* WINDOWTITLE = "Joseph McFadden";
-const char* GLUITITLE = "Chess with me mate?";
-
-// what the glui package defines as true and false:
-const int GLUITRUE = true;
-const int GLUIFALSE = false;
+// title of the window:
+const char* WINDOWTITLE = "Chess With Me Mate? - Joseph McFadden";
 
 // the escape key:
 const int ESCAPE = 0x1b;
@@ -161,53 +145,75 @@ const int ESCAPE = 0x1b;
 const int viewportHeight = 700;
 const int viewportWidth = 700;
 
-// multiplication factors for input interaction:
-//  (these are known from previous experience)
-const float ANGFACT = 1.f;
-const float SCLFACT = 0.005f;
-
-// allowable scale factors:
-const float zoomSpeed = 5.0f;
-const float minFov = 0.05f;		// Minimun FOV
-const float maxFov = 150.0f;	// Maximum FOV
-
 // scroll wheel button values:
 const int SCROLL_WHEEL_UP = 3;
 const int SCROLL_WHEEL_DOWN = 4;
 
-// active mouse buttons (or them together):
-const int LEFT = 4;
-const int MIDDLE = 2;
-const int RIGHT = 1;
-
 // line width for the axes:
 const GLfloat AXES_WIDTH = 3.;
 
-const float piecePosScale = 20.;
-const float observableScale = 1.;
-const float fallingDuration = 20.0f;
+// the board: each tile is TILE x TILE world units, centered on the origin
+const float TILE = 20.f;
+const float HIGHLIGHT_Y = 0.2f;		// highlights float just above the board to avoid z-fighting
+const float SELECTED_LIFT = 4.f;	// selected piece sits up off its square
+const float BORDER = 16.f;			// width of the frame around the board, holds the a-h / 1-8 labels
 
-int		DebugOn;				// != 0 means to print debugging info
-float	Time;
-float	nowTime;
-const int MSEC = 10000;
-float elapsedALLTIME;
-#pragma endregion 
+// camera (orbits the center of the board):
+const float CAM_FOV = 20.f;		// degrees
+const float CAM_DIST = 620.f;		// far enough to fit the board and its border
+const float CAM_DIST_MIN = 250.f;
+const float CAM_DIST_MAX = 1100.f;
+const float CAM_PITCH = 68.f;		// degrees above the board
+const float CAM_PITCH_MIN = 12.f;
+const float CAM_PITCH_MAX = 89.5f;
+const float ORBIT_SPEED = 0.4f;		// degrees per pixel dragged
+const float ORBIT_KEY_STEP = 5.f;	// degrees per arrow key press
+const float ZOOM_FACTOR = 1.1f;
+
+// animation timing, in seconds:
+const float MOVE_TIME_BASE = 0.16f;
+const float MOVE_TIME_PER_TILE = 0.05f;
+const float MOVE_TIME_MAX = 0.55f;
+const float HOP_HEIGHT = 5.f;
+const float KNIGHT_HOP_HEIGHT = 16.f;
+const float CONTACT_FRACTION = 0.8f;	// how far into a capture the victim starts to fall
+const float FALL_TIME = 0.9f;
+const float FADE_TIME = 0.45f;
+
+// lighting:
+const float LIGHT_RADIUS = 20.0f;
+const float LIGHT_HEIGHT = 90.0f;
+
+#pragma endregion
 
 #pragma region Enums
 
-// Chess piece types
-enum PieceType
+// which projection:
+enum Projections
 {
-	PAWN,
-	KNIGHT,
-	BISHOP,
-	ROOK,
-	QUEEN,
-	KING
+	ORTHO,
+	PERSP
 };
 
-std::string PieceTypeToString(PieceType type) {
+// main menu entries:
+enum ButtonVals
+{
+	RESET,
+	QUIT,
+	NEW_GAME,
+	UNDO
+};
+
+// camera presets:
+enum Views
+{
+	VIEW_WHITE,
+	VIEW_BLACK,
+	VIEW_TOP
+};
+
+std::string PieceTypeToString(int type)
+{
 	switch (type) {
 	case PAWN:   return "Pawn";
 	case KNIGHT: return "Knight";
@@ -219,1159 +225,121 @@ std::string PieceTypeToString(PieceType type) {
 	}
 }
 
-
-// which projection:
-enum Projections
-{
-	ORTHO,
-	PERSP
-};
-
-// which button:
-enum ButtonVals
-{
-	RESET,
-	QUIT
-};
-
-// not implemented
-enum Views
-{
-	INSIDE_OUT,
-	ANGLED,
-	HEAD_ON
-};
-
-enum Colors
-{
-	RED,
-	YELLOW,
-	GREEN,
-	CYAN,
-	BLUE,
-	MAGENTA
-};
 #pragma endregion
 
 #pragma region Global Classes
-struct BoundingBox
-{
-	glm::vec3 origin;        // Origin of the bounding box
-	glm::vec3 extents;       // Distance from the origin to the min/max points
 
-	// Constructor to initialize with minimum and maximum values
-	BoundingBox(const glm::vec3& minimum, const glm::vec3& maximum, glm::vec3 o)
-		: extents((maximum - minimum) * 0.5f), origin(o)
-	{
-	}
-
-	BoundingBox(const glm::vec3& ex, glm::vec3 o) : origin(o), extents(ex)
-	{}
-
-	BoundingBox() 
-	{
-		origin = glm::vec3(0);
-		extents = glm::vec3(0);
-	}
-
-	// Calculate and return the minimum point
-	glm::vec3 min() const {
-		return origin - extents;
-	}
-
-	// Calculate and return the maximum point
-	glm::vec3 max() const {
-		return origin + extents;
-	}
-
-	// Calculate and return the minimum point
-	glm::vec3 observedMin() const {
-		glm::vec3 minVec = min();
-		return glm::vec3(minVec.x * observableScale, minVec.y, minVec.z * observableScale);
-	}
-
-	glm::vec3 observedMax() const {
-		glm::vec3 maxVec = max();
-		return glm::vec3(maxVec.x * observableScale, maxVec.y, maxVec.z * observableScale);
-	}
-
-	void move()
-	{
-		try {
-			glTranslatef(origin.x, origin.y, origin.z);
-			
-		}
-		catch (const std::exception& e) {
-			throw std::runtime_error("Error with keeping origin pointer");
-		}
-	}
-
-	bool Intersects(const BoundingBox& other) {
-		// Check if there is no overlap in any dimension
-		if (max().x < other.min().x || min().x > other.max().x) return false;
-		if (max().y < other.min().y || min().y > other.max().y) return false;
-		if (max().z < other.min().z || min().z > other.max().z) return false;
-
-		return true; // Overlaps in all dimensions
-	}
-};
-
+// One of the 32 pieces on screen. The rules live in ChessRules; this is just
+// where a piece is drawn and what it is doing (sliding, falling, fading).
 struct Piece
 {
-	std::string name;
-	std::string TileLocation;
-	char* file;
-	float scale;
-	GLuint displayList;
-	GLuint bboxList;
-	unsigned int texObject;
-	bool isSelected;
-	bool isHovered; // to be imlemented
-	glm::vec3 origin; // essentially x/z 
-	glm::vec3 dimensions; // Dimensions for the bounding box
-	BoundingBox boundingBox;
+	int type = PAWN;
+	bool isWhite = true;
+	int square = -1;		// board square, or -1 once captured
+	bool visible = false;
+	glm::vec3 pos = glm::vec3(0.f);
 
+	// sliding/hopping to a new square:
+	bool moving = false;
+	glm::vec3 moveFrom = glm::vec3(0.f);
+	glm::vec3 moveTo = glm::vec3(0.f);
+	float moveStart = 0.f;
+	float moveTime = 0.f;
+	float hop = 0.f;
+	int promoteTo = NO_PIECE;
+	Piece* victim = nullptr;
 
-	// Additional game-related properties
-	PieceType type; 
-	bool isWhite;
-	glm::vec3 color; // For rendering the piece with a specific color
+	// tipping over and fading out after being captured:
+	bool dying = false;
+	float deathStart = 0.f;
+	glm::vec3 fallAxis = glm::vec3(1.f, 0.f, 0.f);
+	float opacity = 1.f;
 
-	glm::vec3 startPosition; // Starting position for the animation
-	glm::vec3 endPosition; // Ending position for the animation
-	float startTime; // Time when the animation starts
-	bool isAnimating = false; // Flag to indicate if the piece is currently animating
-
-	float fallingStartTime;
-	
-	bool isDying = false;
-	BoundingBox pieceIamKillingsBox;
-	
-	bool isFading = false;
-	float opacity = 1.0f;
-	bool isDead = false;
-
-	/** 
-	 * @brief Construct a new Chess Piece object
-	 *
-	 * @param nm Name of the chess piece (e.g., "White Pawn").
-	 * @param fl Filename for the object (e.g., "pieces/pawn.obj").
-	 * @param scl Scale for rendering the piece.
-	 * @param isW Flag indicating if the piece is white.
-	 * @param loc origin of the piece in world coordinates.
-	 * @param dims Dimensions of the piece's bounding box.
-	 * @param tp Type of the piece using the PieceType enum.
-	 */
-	Piece(const std::string& nm, const char*& charfl, float scl, bool isW,
-		const glm::vec3& loc, const glm::vec3& dims, PieceType tp, std::string(tileLoc))
-		: name(nm), file(ToChar(charfl)), scale(scl), isSelected(false), isHovered(false),
-		origin(loc), dimensions(dims), type(tp), isWhite(isW), TileLocation(tileLoc)
-	{
-		initself();
-	}
-
-	Piece(const std::string& nm, const std::string& fl, float scl, bool isW,
-		const glm::vec3& loc, const glm::vec3& dims, PieceType tp , std::string(tileLoc))
-		: name(nm), file(ToChar(fl.c_str())), scale(scl), isSelected(false), isHovered(false),
-		origin(loc), dimensions(dims), type(tp), isWhite(isW), TileLocation(tileLoc)
-	{
-		initself();
-	}
-
-	void initself()
-	{
-		// Initialize displayList, texObject, and other properties here
-		displayList = 0;
-		texObject = 0;
-
-		// The color can be set based on whether the piece is white or black
-		color = isWhite ? glm::vec3(1.0f, 1.0f, 1.0f) : glm::vec3(0.0f, 0.0f, 0.0f);
-
-
-	}
-
-	bool IsAboutToKill() {
-		return boundingBox.Intersects(pieceIamKillingsBox);
-	}
-
-	void startAnimation(const glm::vec3& endPos) {
-		startPosition = origin; // Current position becomes the start position
-		endPosition = endPos; // Set the end position
-		startTime = Time; // Record the start time
-		isAnimating = true; // Set the animation flag
-	}
-
-	void endAnimation() {
-		// clear 
-		startPosition = glm::vec3(); 
-		endPosition = glm::vec3();
-		startTime = -11111; 
-		isAnimating = false; // Set the animation flag
-	}
-
-	void startFadeAnimation() {
-		isFading = true;
-		opacity = 1.0f; // Start fully opaque
-	}
-
-	void startDeathAnimation()
-	{
-		isDying = true;
-		fallingStartTime = elapsedALLTIME;
-	}
-
-	void endDeathAnimation() 
-	{
-		isDying = false;
-		startFadeAnimation();
-	}
-
-	void moveSelf(glm::vec3 translation)
-	{
-		glTranslatef(translation[0], translation[1], translation[2]);
-		boundingBox.origin = translation;
-		// update all the properties for the object
-	}
-
-	void callSelf()
-	{
-		// Save the current matrix state:
-		glPushMatrix();
-
-		// Disable lighting temporarily: for textyres I think
-		//glDisable(GL_LIGHTING);
-
-		if (isDying)
-		{
-			float elapsedTime = (elapsedALLTIME - fallingStartTime) ; // Scale to milliseconds
-			float currentAngle = GetFallingTime(elapsedTime); // Scale back to seconds
-
-            glRotatef(currentAngle, 1.f, 0., 0.); // Handle the rotation using keyframes
-
-            if (elapsedTime >= fallingDuration) {
-                endDeathAnimation();
-            }
-		}
-		else if (isFading) {
-			opacity -= 0.01f;
-			if (opacity <= 0) {
-				opacity = 0;
-				isFading = false;
-				isDead = true;
-			}
-		}
-
-		moveSelf(origin);
-
-		if (isWhite)
-			glColor4f(WHITE[0], WHITE[1], WHITE[2], opacity);
-		else
-			glColor4f(BLACK[0], BLACK[1], BLACK[2], opacity);
-
-		// Draw the sphere:
-		glCallList(displayList);
-
-		// Restore lighting state: for textyres I think
-		//glEnable(GL_LIGHTING);
-
-		// Restore the previous matrix state:
-		glPopMatrix();
-	}
-
-	void callBox()
-	{
-		// Save the current matrix state:
-		glPushMatrix();
-
-		// Disable lighting temporarily:
-		glDisable(GL_LIGHTING);
-
-		boundingBox.move();
-
-		glColor3f(1.f, 0.f, 0.0f);
-
-		// Draw the sphere:
-		glCallList(bboxList);
-
-		// Restore lighting state:
-		glEnable(GL_LIGHTING);
-
-		// Restore the previous matrix state:
-		glPopMatrix();
-	}
-
-	GLuint DrawPiece(glm::vec3& min, glm::vec3& max, glm::vec3& origin)
-	{
-		GLuint dl = glGenLists(1);
-		glNewList(dl, GL_COMPILE);
-		SetMaterial(color[0], color[1], color[2], 70.f);
-		//glBindTexture(GL_TEXTURE_2D, texObject);
-		glPushMatrix();
-		//glScalef(scale, scale, scale);
-
-		LoadObjFile(file, min, max, origin);
-
-		glPopMatrix();
-		glEndList();
-
-		return dl;
-	}
-
-	void makeMoves() {
-		if (!isAnimating) return; // Do nothing if not animating
-
-		float duration = .1f; // Total animation duration in seconds
-		float elapsed = Time - startTime;
-		if (elapsed >= duration) {
-			elapsed = duration; // Clamp elapsed time
-			isAnimating = false; // End animation
-			origin = endPosition; // Ensure the piece reaches the final position
-		}
-
-		float normalizedTime = elapsed / duration;
-		origin = glm::mix(startPosition, endPosition, normalizedTime);
-
-		// Sine wave adjustments for smooth movement
-		float waveAmplitude = 0.5f; // Amplitude of the sine wave
-		float waveFrequency = 2.0f; // Frequency of the sine wave
-		float sineValue = waveAmplitude * sin(waveFrequency * glm::pi<float>() * normalizedTime);
-
-		// Assuming the y-coordinate is the vertical axis. Change this if your coordinate system is different.
-		origin.y += sineValue;
-
-	/*	if (pieceIamKillingsBox != nullptr) {
-			if (!pieceIamKillingsBox->isDying && IsAboutToKill()) {
-				pieceIamKillingsBox->startDeathAnimation();
-			}
-		}*/
-
-		if (AreVec3Equal(endPosition,origin))
-			endAnimation();
-	}
-
-	// Note this must be called before any translation is made if you want the original bounding box
-	GLuint DrawBoundingBox()
-	{
-		glm::vec3 min = boundingBox.observedMin();
-		glm::vec3 max = boundingBox.observedMax();
-
-		GLuint dl = glGenLists(1);
-		glNewList(dl, GL_COMPILE);
-		glColor3f(1.0f, .0f, .0f); // Set color to red for the bounding box lines
-		glDisable(GL_LIGHTING); // Disable lighting for drawing lines
-		glDisable(GL_TEXTURE_2D); // Disable textures
-		glPushMatrix();
-
-		// Draw the bounding box as line loops
-		glBegin(GL_LINE_LOOP);
-		glVertex3f(min.x, min.y, min.z);
-		glVertex3f(max.x, min.y, min.z);
-		glVertex3f(max.x, max.y, min.z);
-		glVertex3f(min.x, max.y, min.z);
-		glEnd();
-
-		glBegin(GL_LINE_LOOP);
-		glVertex3f(min.x, min.y, max.z);
-		glVertex3f(max.x, min.y, max.z);
-		glVertex3f(max.x, max.y, max.z);
-		glVertex3f(min.x, max.y, max.z);
-		glEnd();
-
-		glBegin(GL_LINES);
-		glVertex3f(min.x, min.y, min.z);
-		glVertex3f(min.x, min.y, max.z);
-		glVertex3f(max.x, min.y, min.z);
-		glVertex3f(max.x, min.y, max.z);
-		glVertex3f(max.x, max.y, min.z);
-		glVertex3f(max.x, max.y, max.z);
-		glVertex3f(min.x, max.y, min.z);
-		glVertex3f(min.x, max.y, max.z);
-		glEnd();
-
-		glPopMatrix();
-		glEnable(GL_LIGHTING); // Re-enable lighting
-		glEnable(GL_TEXTURE_2D); // Re-enable textures
-		glEndList();
-
-		return dl;
-	}
+	bool Busy() const { return moving || dying; }
 };
-
-struct Tile {
-	glm::vec3 position;       // Position of the tile center
-	BoundingBox boundingBox;  // Bounding box for interaction
-	std::string notation;     // Chess notation for the tile (e.g., A1, A2, ..., H8)
-	glm::vec3 extents;        // Extents of the tile
-
-	Tile(const glm::vec3& pos, const glm::vec3& size, const std::string& note)
-		: position(pos), extents(size * 0.5f), notation(note)
-	{
-		boundingBox = BoundingBox(extents, pos);
-	}
-};
-
-struct Board {
-	std::vector<Tile> tiles;  // Container for all chess tiles
-	GLuint boardList;
-
-	// Function to initialize the board
-	void initBoard(float piecePosScale) {
-		tiles.clear();
-		glm::vec3 tileSize(1.0f * piecePosScale, 0.2f * piecePosScale, 1.0f * piecePosScale); // Size of each tile
-
-		// Assuming 8x8 board
-		for (int row = 0; row < 8; ++row) {
-			for (int col = 0; col < 8; ++col) {
-				glm::vec3 tilePosition((col - 3.5f) * piecePosScale, 0.0f, (row - 3.5f) * piecePosScale);
-				std::string notation = char('A' + col) + std::to_string(8 - row); // Generating notation
-				tiles.emplace_back(tilePosition, tileSize, notation);
-			}
-		}
-
-		if (DebugOn == 1)
-			LogTiles();
-	}
-
-	// Function to create a display list for rendering the chessboard
-	void drawBoard() {
-		// Generate a new display list ID
-		boardList = glGenLists(1);
-
-		// Compile the display list
-		glNewList(boardList, GL_COMPILE);
-
-		// Set the colors for white and black squares
-		glm::vec3 whiteColor(1.0f, 1.0f, 1.0f);
-		glm::vec3 blackColor(0.1f, 0.1f, 0.1f);
-
-		// Loop through the tiles in the chess board and render squares
-		for (int row = 0; row < 8; ++row) {
-			for (int col = 0; col < 8; ++col) {
-				// Get the corresponding tile for the current row and column
-				const Tile& tile = tiles[row * 8 + col];
-
-				glm::vec3 squareColor = ((row + col) % 2 == 0) ? whiteColor : blackColor;
-
-				glColor3fv(glm::value_ptr(squareColor));
-				glBegin(GL_QUADS);
-				glVertex3f(tile.position.x - tile.extents.x, 0.0f, tile.position.z - tile.extents.z);
-				glVertex3f(tile.position.x + tile.extents.x, 0.0f, tile.position.z - tile.extents.z);
-				glVertex3f(tile.position.x + tile.extents.x, 0.0f, tile.position.z + tile.extents.z);
-				glVertex3f(tile.position.x - tile.extents.x, 0.0f, tile.position.z + tile.extents.z);
-				glEnd();
-			}
-		}
-
-		// End the display list compilation
-		glEndList();
-	}
-
-	void callBoard()
-	{
-		// Save the current matrix state:
-		glPushMatrix();
-
-		// Disable lighting temporarily:
-		glDisable(GL_LIGHTING);
-
-		// Draw the sphere:
-		glCallList(boardList);
-
-		// Restore lighting state:
-		glEnable(GL_LIGHTING);
-
-		// Restore the previous matrix state:
-		glPopMatrix();
-	}
-
-	void LogTiles() const {
-		std::cout << "Tile Details:" << std::endl;
-		for (const Tile& tile : tiles) {
-			std::cout << "Notation: " << tile.notation << std::endl;
-			std::cout << "X Location: " << tile.position.x << std::endl;
-			std::cout << "Y Location: " << tile.position.y << std::endl;
-			std::cout << "Z Location: " << tile.position.z << std::endl;
-			std::cout << "-------------------" << std::endl;
-		}
-	}
-};
-
-struct Chess
-{
-	Board board;
-	std::vector<Piece> WhitePieces;
-	std::vector<Piece> BlackPieces;
-	Piece* firstPieceSel;
-	Piece* secondPieceSel;
-	Tile* tileSelected;
-
-	Chess(const std::vector<Piece>& wp, const std::vector<Piece>& bp)
-		: WhitePieces(wp), BlackPieces(bp)
-	{}
-
-	Chess() {}
-
-	void InitChess() {
-		// Initialize the board first
-		board.initBoard(piecePosScale);
-
-		// Initialize Pieces
-		InitPieces();
-
-		// Update piece locations based on tile notation
-		for (auto& piece : WhitePieces) {
-			UpdateLocationBasedOnTile(piece);
-		}
-		for (auto& piece : BlackPieces) {
-			UpdateLocationBasedOnTile(piece);
-		}
-	}
-
-	void UpdateLocationBasedOnTile(Piece& cp) {
-		for (const auto& tile : board.tiles) {
-			if (tile.notation == cp.TileLocation) {
-				cp.origin = tile.position;
-				break;
-			}
-		}
-	}
-
-	void InitPieces() {
-		// Tile notations for the first row of White and Black pieces
-		const std::string whiteRowNotations[8] = { "A1", "B1", "C1", "D1", "E1", "F1", "G1", "H1" };
-		const std::string blackRowNotations[8] = { "A8", "B8", "C8", "D8", "E8", "F8", "G8", "H8" };
-		const PieceType pieceTypes[8] = { ROOK, KNIGHT, BISHOP, QUEEN, KING, BISHOP, KNIGHT, ROOK };
-
-		// Initialize White and Black Pieces
-		for (int i = 0; i < 8; ++i) {
-			std::string pieceCount;
-			if (pieceTypes[i] != KING && pieceTypes[i] != QUEEN)
-			{
-				pieceCount = " " + std::to_string(i < 4 ? 1 : 2);
-			}
-
-			std::string whitePieceName = "White " + PieceTypeToString(pieceTypes[i]) + pieceCount;
-			std::string blackPieceName = "Black " + PieceTypeToString(pieceTypes[i]) + pieceCount;;
-
-			WhitePieces.push_back(Piece(whitePieceName, "pieces/" + PieceTypeToString(pieceTypes[i]) + ".obj", 1.f, true, glm::vec3(), glm::vec3(1.f, 1.f, 1.f), pieceTypes[i], whiteRowNotations[i]));
-			BlackPieces.push_back(Piece(blackPieceName, "pieces/" + PieceTypeToString(pieceTypes[i]) + ".obj", 1.f, false, glm::vec3(), glm::vec3(1.f, 1.f, 1.f), pieceTypes[i], blackRowNotations[i]));
-		}
-
-		// Initialize Pawns for White and Black
-		for (char col = 'A'; col <= 'H'; col++) {
-			std::string whitePawnName = "White Pawn " + std::to_string(col - 'A' + 1);
-			std::string blackPawnName = "Black Pawn " + std::to_string(col - 'A' + 1);
-			char* pawnFile = "pieces/Pawn.obj";
-			std::string whiteTileLocation = std::string(1, col) + "2"; // Row 2 for white pawns
-			std::string blackTileLocation = std::string(1, col) + "7"; // Row 7 for black pawns
-
-			WhitePieces.push_back(Piece(whitePawnName, pawnFile, 1.f, true, glm::vec3(), glm::vec3(1.f, 1.f, 1.f), PAWN, whiteTileLocation));
-			BlackPieces.push_back(Piece(blackPawnName, pawnFile, 1.f, false, glm::vec3(), glm::vec3(1.f, 1.f, 1.f), PAWN, blackTileLocation));
-		}
-	}
-
-	Piece* CheckPieceIntersection(const glm::vec3& rayOrigin, const glm::vec3& rayDir)
-	{
-		Piece* closestPiece = nullptr;
-		float closestDistance = std::numeric_limits<float>::max(); // Initialize with the maximum possible float value
-
-		// Check intersection with WhitePieces
-		for (size_t i = 0; i < WhitePieces.size(); ++i) {
-			float distance = 0.0f;
-			if (RayIntersectsBox(rayOrigin, rayDir, WhitePieces[i].boundingBox, distance)) {
-				if (distance < closestDistance) {
-					closestDistance = distance;
-					closestPiece = &WhitePieces[i];
-				}
-			}
-		}
-
-		// Check intersection with BlackPieces
-		for (size_t i = 0; i < BlackPieces.size(); ++i) {
-			float distance = 0.0f;
-			if (RayIntersectsBox(rayOrigin, rayDir, BlackPieces[i].boundingBox, distance)) {
-				if (distance < closestDistance) {
-					closestDistance = distance;
-					closestPiece = &BlackPieces[i];
-				}
-			}
-		}
-
-
-		return closestPiece; // Will be nullptr if no intersection is found
-	}
-
-	Tile* CheckTileIntersection(const glm::vec3& rayOrigin, const glm::vec3& rayDir)
-	{
-		// Check intersection with WhitePieces
-		for (size_t i = 0; i < board.tiles.size(); ++i) {
-			float distance = 0.0f;
-			if (RayIntersectsBox(rayOrigin, rayDir, board.tiles[i].boundingBox, distance)) {
-				return &board.tiles[i];
-			}
-		}
-
-		return nullptr; // Will be null if no intersection is found
-	}
-
-	bool RayIntersectsBox(const glm::vec3& rayOrigin, const glm::vec3& rayDir, const BoundingBox& box, float& distance)
-	{
-		glm::vec3 invDir = 1.0f / rayDir;
-		glm::vec3 t0s = (box.observedMin() - rayOrigin) * invDir;
-		glm::vec3 t1s = (box.observedMax() - rayOrigin) * invDir;
-
-		glm::vec3 tmin = glm::min(t0s, t1s);
-		glm::vec3 tmax = glm::max(t0s, t1s);
-
-		float tminMax = glm::max(glm::max(tmin.x, tmin.y), tmin.z);
-		float tmaxMin = glm::min(glm::min(tmax.x, tmax.y), tmax.z);
-
-		if (tmaxMin < 0 || tminMax > tmaxMin)
-			return false; // No intersection
-
-		distance = tminMax;
-		return true;
-	}
-
-	Piece* doIMovePiece() {
-		if (firstPieceSel != nullptr && secondPieceSel != nullptr) // this is an attack!
-		{
-			if (AreVec3Equal(firstPieceSel->origin, secondPieceSel->origin))
-			{
-				firstPieceSel = nullptr;
-				secondPieceSel = nullptr;
-				return nullptr;
-			}
-			return firstPieceSel;
-		}
-		else if (firstPieceSel != nullptr && tileSelected != nullptr) // this is a move
-		{
-			if (AreVec3Equal(firstPieceSel->origin, tileSelected->position))
-			{
-				firstPieceSel = nullptr;
-				tileSelected = nullptr;
-				return nullptr;
-			}
-			return firstPieceSel;
-		}
-		return nullptr; 
-	}
-
-	int HandleMove()
-	{
-		if (firstPieceSel != nullptr && secondPieceSel != nullptr) // this is an attack!
-		{
-			glm::vec3 destination = secondPieceSel->origin; // Assuming this gives the end position
-			firstPieceSel->startAnimation(destination);
-			firstPieceSel->TileLocation = secondPieceSel->TileLocation;
-		}
-		else if (firstPieceSel != nullptr && tileSelected != nullptr)
-		{
-			glm::vec3 destination = tileSelected->position; // Assuming this gives the end position
-			firstPieceSel->startAnimation(destination);
-			firstPieceSel->TileLocation = tileSelected->notation;
-		}
-		
-		else if (firstPieceSel == nullptr && tileSelected == nullptr) {
-			fprintf(stderr, "Error: Both pointers are empty.\n");
-			return 0;
-		}
-		else if (firstPieceSel == nullptr) {
-			fprintf(stderr, "Error: firstPieceSel pointer is empty.\n");
-			return 0;
-		}
-		else {
-			fprintf(stderr, "Error: tileSelected pointer is empty.\n");
-			return 0;
-		}
-		
-		return 1;
-	}
-	
-	int HandleAttack() {
-		return 0;
-	}
-
-	Piece* getPieceByName(const std::string& pieceName) {
-		// Search in white pieces
-		for (Piece& piece : WhitePieces) {
-			if (piece.name == pieceName) {
-				return &piece; // Return a pointer to the found piece
-			}
-		}
-
-		// Search in black pieces
-		for (Piece& piece : BlackPieces) {
-			if (piece.name == pieceName) {
-				return &piece; // Return a pointer to the found piece
-			}
-		}
-
-		return nullptr; // No piece found with the given name
-	}
-
-
-#pragma region Moving Rules / Logic
-
-	bool IsPathClear(const std::string& start, const std::string& end) {
-		// Check if it's a diagonal move
-		bool isDiagonal = (abs(start[0] - end[0]) == abs(start[1] - end[1]));
-
-		// Check if it's a straight move (same column or same row)
-		bool isStraight = (start[0] == end[0]) || (start[1] == end[1]);
-
-		if (!isDiagonal && !isStraight) {
-			return false; // Neither diagonal nor straight move
-		}
-
-		// Handle diagonal moves
-		if (isDiagonal) {
-			// Determine the direction of the diagonal
-			int xDirection = (start[0] < end[0]) ? 1 : -1;
-			int yDirection = (start[1] < end[1]) ? 1 : -1;
-
-			// Check each tile along the diagonal path
-			char currentX = start[0] + xDirection;
-			char currentY = start[1] + yDirection;
-			while (currentX != end[0] && currentY != end[1]) {
-				std::string location = std::string(1, currentX) + std::string(1, currentY);
-				Piece* piece = GetPieceAtLocation(location);
-
-				if (piece != nullptr) {
-					// There's a piece in the way, so the path is not clear
-					return false;
-				}
-
-				// Move to the next tile along the diagonal path
-				currentX += xDirection;
-				currentY += yDirection;
-			}
-		}
-
-		// Handle straight moves
-		if (isStraight) {
-			// Check if it's a horizontal move (same column)
-			if (start[0] == end[0]) {
-				int startY = start[1] - '0';
-				int endY = end[1] - '0';
-				int yDirection = (startY < endY) ? 1 : -1;
-
-				// Check each tile along the horizontal path
-				char currentY = start[1] + yDirection;
-				while (currentY != end[1]) {
-					std::string location = std::string(1, start[0]) + std::string(1, currentY);
-					Piece* piece = GetPieceAtLocation(location);
-
-					if (piece != nullptr) {
-						// There's a piece in the way, so the path is not clear
-						return false;
-					}
-
-					// Move to the next tile along the horizontal path
-					currentY += yDirection;
-				}
-			}
-			else {
-				// Handle vertical moves
-				int startX = start[0] - 'A' + 1;
-				int endX = end[0] - 'A' + 1;
-				int xDirection = (startX < endX) ? 1 : -1;
-
-				// Check each tile along the vertical path
-				char currentX = start[0];
-				while (currentX != end[0]) {
-					std::string location = std::string(1, currentX) + end.substr(1);
-					Piece* piece = GetPieceAtLocation(location);
-
-					if (piece != nullptr) {
-						// There's a piece in the way, so the path is not clear
-						return false;
-					}
-
-					// Move to the next tile along the vertical path
-					currentX += xDirection;
-				}
-			}
-		}
-
-		// If the loop completes without finding any pieces in the path, the path is clear
-		return true;
-	}
-
-	Piece* GetPieceAtLocation(const std::string& location) {
-		// Iterate through all pieces and find the one with the matching TileLocation
-		for (Piece& piece : WhitePieces) {
-			if (piece.TileLocation == location) {
-				return &piece;
-			}
-		}
-
-		for (Piece& piece : BlackPieces) {
-			if (piece.TileLocation == location) {
-				return &piece;
-			}
-		}
-
-		return nullptr; // No piece found at the given location
-	}
-
-	bool ValidatePawnMove(const Piece& piece, const std::string& targetLocation, const Piece* targetPiece) {
-		// Determine the direction of movement based on whether it's a white or black pawn
-		int direction = (piece.isWhite) ? 1 : -1;
-
-		// Calculate the difference in rows (numbers) between the start and target locations
-		int rowDifference = (targetLocation[1] - piece.TileLocation[1]) * direction;
-		int colDifference = targetLocation[0] - piece.TileLocation[0];
-
-		// Check for a valid vertical move
-		if (colDifference == 0) {
-			if (rowDifference == 1 && targetPiece == nullptr) {
-				// Regular single move forward
-				return true;
-			}
-			else if (rowDifference == 2 && ((piece.isWhite && piece.TileLocation[1] == '2') || (!piece.isWhite && piece.TileLocation[1] == '7')) && targetPiece == nullptr) {
-				// First move allows for a double move forward from the starting position
-				return true;
-			}
-		}
-
-		// Check for a valid diagonal capture
-		if (std::abs(colDifference) == 1 && rowDifference == 1 && targetPiece != nullptr) {
-			// Diagonal capture
-			return true;
-		}
-
-		// Invalid move
-		return false;
-	}
-
-	bool ValidateKnightMove(const Piece& piece, const std::string& targetLocation) {
-		// Calculate the absolute horizontal and vertical distance between current and target locations
-		int deltaX = abs(targetLocation[0] - piece.TileLocation[0]);
-		int deltaY = abs(targetLocation[1] - piece.TileLocation[1]);
-
-		// Check if the move is in an L-shape (2 squares in one direction and 1 square in another)
-		if ((deltaX == 2 && deltaY == 1) || (deltaX == 1 && deltaY == 2)) {
-			// Get the piece at the target location
-			Piece* targetPiece = GetPieceAtLocation(targetLocation);
-
-			if (targetPiece == nullptr) {
-				// No piece at the target location, allow the move
-				return true;
-			}
-			else if (targetPiece->isWhite != piece.isWhite) {
-				// Piece at the target location is of a different color, allow capturing
-				return true;
-			}
-		}
-
-		// Piece at the target location is of the same color or the move is invalid
-		return false;
-	}
-
-
-	bool ValidateBishopMove(const Piece& piece, const std::string& targetLocation) {
-		
-
-		if (!IsPathClear(piece.TileLocation, targetLocation))
-			return false;
-		// Get the piece at the target location
-		Piece* targetPiece = GetPieceAtLocation(targetLocation);
-
-
-		if (targetPiece == nullptr) {
-			// No piece at the target location, allow the move
-			return true;
-		}
-		else if (targetPiece->isWhite != piece.isWhite) {
-			// Piece at the target location is of a different color, allow capturing
-			return true;
-		}
-
-		// Piece at the target location is of the same color, disallow the move
-		return false;
-	}
-
-
-	bool ValidateRookMove(const Piece& piece, const std::string& targetLocation) {
-		if (!IsPathClear(piece.TileLocation, targetLocation))
-			return false;
-
-		// Get the piece at the target location
-		Piece* targetPiece = GetPieceAtLocation(targetLocation);
-
-		if (targetPiece == nullptr) {
-			// No piece at the target location, allow the move
-			return true;
-		}
-		else if (targetPiece->isWhite != piece.isWhite) {
-			// Piece at the target location is of a different color, allow capturing
-			return true;
-		}
-
-		// Piece at the target location is of the same color, disallow the move
-		return false;
-	}
-
-
-	bool ValidateQueenMove(const Piece& piece, const std::string& targetLocation) {
-
-		if (!IsPathClear(piece.TileLocation, targetLocation))
-			return false;
-
-		// Get the piece at the target location
-		Piece* targetPiece = GetPieceAtLocation(targetLocation);
-
-		if (targetPiece == nullptr) {
-			// No piece at the target location, allow the move
-			return true;
-		}
-		else if (targetPiece->isWhite != piece.isWhite) {
-			// Piece at the target location is of a different color, allow capturing
-			return true;
-		}
-
-		// Piece at the target location is of the same color, disallow the move
-		return false;
-	}
-
-
-	bool ValidateKingMove(const Piece& piece, const std::string& targetLocation) {
-		// Get the piece at the target location
-		Piece* targetPiece = GetPieceAtLocation(targetLocation);
-
-		if (targetPiece == nullptr) {
-			// No piece at the target location, allow the move
-			return true;
-		}
-		else if (targetPiece->isWhite != piece.isWhite) {
-			// Piece at the target location is of a different color, allow capturing
-			return true;
-		}
-
-		// Piece at the target location is of the same color, disallow the move
-		return false;
-	}
-
-
-	bool IsMoveLegal(const Piece& piece, const std::string& targetLocation) {
-		Piece* targetPiece = GetPieceAtLocation(targetLocation);
-
-		switch (piece.type) {
-		case PieceType::PAWN:
-			return ValidatePawnMove(piece, targetLocation, targetPiece);
-		case PieceType::KNIGHT:
-			return ValidateKnightMove(piece, targetLocation);
-		case PieceType::BISHOP:
-			return ValidateBishopMove(piece, targetLocation);
-		case PieceType::ROOK:
-			return ValidateRookMove(piece, targetLocation);
-		case PieceType::QUEEN:
-			return ValidateQueenMove(piece, targetLocation);
-		case PieceType::KING:
-			return ValidateKingMove(piece, targetLocation);
-		default:
-			return false;
-		}
-	}
-
-#pragma endregion
-
-	void HandleSelection(const glm::vec3& rayOrigin, const glm::vec3& rayDir)
-	{
-		if (DebugOn == 1) {
-			fprintf(stderr, "Ray origin: %f, %f, %f Ray direction: %f, %f, %f\n",
-				rayOrigin.x, rayOrigin.y, rayOrigin.z,
-				rayDir.x, rayDir.y, rayDir.z);
-		}
-
-		Piece* cp = CheckPieceIntersection(rayOrigin, rayDir);
-		Tile* tile = CheckTileIntersection(rayOrigin, rayDir);
-		if (tile != nullptr)
-			fprintf(stderr, "Clicked on %s\n", tile->notation.c_str());
-		// check if first piece slected only select a piece if no 1st selected
-		if (firstPieceSel == nullptr)
-		{
-
-			if (cp != nullptr) { 
-				firstPieceSel = cp;
-				fprintf(stderr, "Clicked on %s\n", firstPieceSel->name.c_str());
-				firstPieceSel->isSelected = true;
-			}
-			else {
-				tileSelected = nullptr;
-				fprintf(stderr, "No piece was clicked.\n");
-			}
-		}
-		else {
-			if (cp != nullptr) { // piece is selcted and might attack
-				if (cp->name == firstPieceSel->name)
-				{
-					firstPieceSel == nullptr;
-					firstPieceSel->isSelected = false;
-				}
-				else {
-					secondPieceSel = cp;
-					fprintf(stderr, "Clicked on %s\n", secondPieceSel->name.c_str());
-					secondPieceSel->isSelected = true;
-
-					fprintf(stderr, "Attempting to attack %s to %s...\n", firstPieceSel->name.c_str(), secondPieceSel->name.c_str());
-
-					if (IsMoveLegal(*firstPieceSel, secondPieceSel->TileLocation.c_str())) {
-						// Handle the legal move
-						firstPieceSel->pieceIamKillingsBox = secondPieceSel->boundingBox;
-						HandleMove();
-						HandleAttack(); 
-
-						fprintf(stderr, "Attack Move is legal!\n");
-					}
-					else {
-						secondPieceSel = nullptr;
-						firstPieceSel = nullptr;
-						fprintf(stderr, "Move is not legal!\n");
-					}
-				}
-			}
-			else 
-			{
-				tileSelected = tile;
-				if (tileSelected != nullptr)
-				{
-					fprintf(stderr, "Clicked on %s\n", tileSelected->notation.c_str());
-
-					// Attempting to make a move
-					fprintf(stderr, "Attempting to move %s to %s...\n", firstPieceSel->name.c_str(), tileSelected->notation.c_str());
-
-					// Check move legality
-					if (IsMoveLegal(*firstPieceSel, tileSelected->notation.c_str())) {
-						// Handle the legal move
-						HandleMove();
-						fprintf(stderr, "Move is legal!\n");
-					}
-					else {
-						// Move is not legal
-						tileSelected = nullptr;
-						firstPieceSel = nullptr;
-						fprintf(stderr, "Move is not legal!\n");
-					}
-				}
-				else {
-					tileSelected = nullptr;
-					firstPieceSel = nullptr;
-					secondPieceSel = nullptr;
-					fprintf(stderr, "No piece or tile was clicked.\n");
-				}
-			}
-		}
-	}
-};
-
-#pragma endregion
-
-#pragma region grid
-#define XSIDE	10000			// length of the x side of the grid
-#define X0      (-XSIDE/2.)		// where one side starts
-#define NX		1000			// how many points in x
-#define DX		( XSIDE/(float)NX )	// change in x between the points
-
-#define YGRID	-4.f
-// XY base for grid
-//#define YSIDE	1000			// length of the z side of the grid
-//#define Y0      (-YSIDE/2.)		// where one side starts
-//#define NY		1000			// how many points in z
-//#define DY		( YSIDE/(float)NY )	// change in z between the points
-
-#define ZSIDE	10000			// length of the z side of the grid
-#define Z0      (-ZSIDE/2.)		// where one side starts
-#define NZ	1000			// how many points in z
-#define DZ	( ZSIDE/(float)NZ )	// change in z between the points
-#pragma endregion
-
-#pragma region  Lighting
-
-// fog parameters:
-const GLfloat FOGCOLOR[4] = { .0f, .0f, .0f, 1.f };
-const GLenum  FOGMODE     = GL_LINEAR;
-const GLfloat FOGDENSITY  = 0.30f;
-const GLfloat FOGSTART    = 1.5f;
-const GLfloat FOGEND      = 4.f;
-
-// for lighting:
-
-const float LIGHT_RADIUS = 20.0f;
-const float LIGHT_HEIGHT = 90.0f;
-
-#pragma endregion
-
-#pragma region animation
-
-// for animation:
-		// 10000 milliseconds = 10 seconds
-bool	Frozen;
-int lastPrintTime = 0;
-
-#pragma endregion
-
-#pragma region ComplileOptions
-
-// what options should we compile-in?
-// in general, you don't need to worry about these
-// i compile these in to show class examples of things going wrong
-//#define DEMO_Z_FIGHTING
-//#define DEMO_DEPTH_BUFFER
 
 #pragma endregion
 
 #pragma region Non-Constant Global Variables
 
-// non-constant global variables:
-
 int		ActiveButton;			// current button that is down
-
-GLuint PawnList; 
-//PlanetType PlanetNow;
-bool TextureType;
-bool LightMode;
-//GLuint	VenusTex, EarthTex, MarsTex, JupiterTex, SaturnTex, UranusTex, NeptuneTex;
-GLuint	AxesList, GridList;				
+GLuint	AxesList, BoardList;
+GLuint	PieceLists[KING + 1];		// one display list per piece type, shared by both colors
+glm::vec3 PieceMin[KING + 1], PieceMax[KING + 1];	// model extents, a quick first test for picking
+std::vector<glm::vec3> PieceTris[KING + 1];			// model triangles (3 verts each), for exact picking
 int		AxesOn;					// != 0 means to draw the axes
+int		DebugOn;				// != 0 means to draw the pick ray and bounding boxes
 int		DepthCueOn;				// != 0 means to use intensity depth cueing
-int		DepthBufferOn;			// != 0 means to use the z-buffer
-int		DepthFightingOn;		// != 0 means to force the creation of z-fighting
+bool	Frozen;
 int		MainWindow;				// window id for main graphics window
 int		NowColor;				// index into Colors[ ]
-int		NowProjection = PERSP;	// ORTHO or PERSP
-float	Scale;					// scaling factor
-int		ShadowsOn;				// != 0 means to turn shadows on
-//float	Time;					// used for animation, this has a value between 0. and 1.
-
+int		NowProjection;			// ORTHO or PERSP
 int		Xmouse, Ymouse;			// mouse values
-float	Xrot, Yrot;				// rotation angles in degrees
-float	LastPrintTime = -1.0f;
-int		CurrentView = ANGLED;	// Default view
-Keytimes fallingAnimation;
+int		LightColorNow = LIGHT_WHITE;
+bool	isSpotLight = false;	// default is a point light
 
-float LightAngle; // angle of light in radians
-float xLightPos;  // x position of the light
-float zLightPos;  // z position of the light
-int LightColorNow = 6;
-bool isSpotLight = false;  // Default is Point Light
+// camera:
+float	CamYaw, CamPitch, CamDist;	// degrees, degrees, world units
+glm::vec3 CamEye;
+glm::mat4 ViewMatrix;
+glm::mat4 ProjMatrix;
+glm::vec4 Viewport;				// x, y, width, height of the square drawing area
 
+// animation clock -- only advances while something is animating and we're not frozen:
+float	AnimTime;
+int		LastAnimMs;
+bool	Animating;
+Keytimes FallingAnimation;
 
-GLfloat light_direction[];
-glm::mat4 viewMatrix;
-glm::mat4 projMatrix;
-float aspectRatio;
+// the game:
+ChessRules Rules;
+Piece	Pieces[32];
+Piece*	PieceAt[64];			// which on-screen piece is standing on each square
+std::vector<Move> LegalMoves;	// every legal move for the side to move
+GameStatus Status;
+int		SelectedSq = -1;
+int		HoverSq = -1;
+std::string LastMoveText;
 
-glm::vec3 cameraPos = glm::vec3(0, 500, 200); // Camera position
-glm::vec3 cameraTarget = glm::vec3(0, 0, 0); // Look-at point
-glm::vec3 upVector = glm::vec3(0, 1, 0);     // Up vector
-float fov = 1.f;                          // Field of view
+// game options (right-click menu > Game Options):
+struct TimeControl
+{
+	const char* name;
+	int minutes;		// 0 = untimed
+	int increment;		// seconds added after each move
+};
+const TimeControl TimeControls[] =
+{
+	{ "Untimed",         0,  0 },
+	{ "Bullet 1+0",      1,  0 },
+	{ "Blitz 3+2",       3,  2 },
+	{ "Blitz 5+0",       5,  0 },
+	{ "Rapid 10+0",     10,  0 },
+	{ "Rapid 15+10",    15, 10 },
+	{ "Classical 30+0", 30,  0 },
+};
+const int NUM_TIME_CONTROLS = sizeof(TimeControls) / sizeof(TimeControls[0]);
+int		TimeControlNow = 0;
+bool	ShowHints = true;
+bool	AutoFlip = false;
+bool	ChoosePromotion = false;
+int		TimeMenu, HintsMenu, FlipMenu, PromoMenu;	// glut menu ids, relabeled to mark the current choice
 
-Chess chess;
+// the chess clock:
+int		ClockMs[2];			// time left, indexed by SIDE_WHITE / SIDE_BLACK
+bool	ClockRunning;		// true from white's first move until the game ends
+bool	ClockPaused;
+int		ClockLastMs;
+int		FlagSide = -1;		// side that ran out of time, or -1
+std::string ClockShown;		// last clock text drawn, to redraw only when it changes
 
-glm::vec3& rayOrigin = glm::vec3(69);
-glm::vec3& rayDir = glm::vec3(69);
+// a pawn reached the last rank and we're waiting for 1-4 to pick the piece:
+int		PendingPromoFrom = -1, PendingPromoTo = -1;
+
+// last pick ray, drawn in debug mode:
+glm::vec3 RayOrigin, RayDir;
+bool	HaveRay;
+
 #pragma endregion
 
 #pragma region CustomMathClasses
@@ -1418,19 +386,6 @@ MulArray3(float factor, float a, float b, float c )
 }
 #pragma endregion
 
-#pragma region weird post includes 
-
-Keytimes LightAngleKT;
-Keytimes Ypos;
-Keytimes ViewAngle;
-Keytimes Grow;
-Keytimes ShakeX;
-Keytimes RedChannel, GreenChannel, BlueChannel;
-Keytimes XPositionKT, ZPositionKT;
-Keytimes TiltKT;
-
-#pragma endregion
-
 #pragma region Main
 // main program:
 
@@ -1447,16 +402,42 @@ main( int argc, char *argv[ ] )
 
 	InitGraphics( );
 
-	// create the display lists that **will not change**:
+	// init all the global variables used by Display( ):
 
 	Reset( );
 
-	chess.InitChess();
-	InitLists( );
-	// init all the global variables used by Display( ):
-	// this will also post a redisplay
+	// command line (handy for testing):
+	//   -d          debug mode (pick ray, boxes, click/move log on stderr)
+	//   -fen "..."  start from a position instead of the opening setup
+	//   -tc N       time control N from the Game Options list (0 = untimed)
+	const char* startFen = nullptr;
+	for( int i = 1; i < argc; i++ )
+	{
+		if( strcmp( argv[i], "-d" ) == 0 )
+			DebugOn = 1;
+		else if( strcmp( argv[i], "-fen" ) == 0 && i + 1 < argc )
+			startFen = argv[++i];
+		else if( strcmp( argv[i], "-tc" ) == 0 && i + 1 < argc )
+			TimeControlNow = glm::clamp( atoi( argv[++i] ), 0, NUM_TIME_CONTROLS - 1 );
+	}
 
-	
+	// create the display lists that **will not change**:
+
+	InitLists( );
+
+	// set up a new game:
+
+	DoMainMenu( NEW_GAME );
+	if( startFen != nullptr )
+	{
+		if( !Rules.LoadFEN( startFen ) )
+		{
+			fprintf( stderr, "Bad -fen position, using the normal setup\n" );
+			Rules.Reset( );
+		}
+		SyncPiecesToBoard( );
+		RefreshGameState( );
+	}
 
 	// setup all the user interface stuff:
 
@@ -1476,222 +457,963 @@ main( int argc, char *argv[ ] )
 
 #pragma endregion
 
+#pragma region Board Helpers
+
+glm::vec3 SquareCenter(int sq)
+{
+	// white's back rank (rank 1) is nearest the default camera at +z:
+	return glm::vec3((FileOf(sq) - 3.5f) * TILE, 0.f, (3.5f - RankOf(sq)) * TILE);
+}
+
+bool IsGameOver()
+{
+	return FlagSide >= 0 || Status == STATUS_CHECKMATE || Status == STATUS_STALEMATE ||
+		Status == STATUS_DRAW_FIFTY || Status == STATUS_DRAW_MATERIAL;
+}
+
+bool IsTimed()
+{
+	return TimeControls[TimeControlNow].minutes > 0;
+}
+
+// a flag fall is only a loss if the other side could still, in theory, checkmate:
+bool HasMatingMaterial(int s)
+{
+	int minors = 0;
+	for (int sq = 0; sq < 64; sq++)
+	{
+		int8_t pc = Rules.board[sq];
+		if (pc == 0 || SideOf(pc) != s)
+			continue;
+		int t = TypeOf(pc);
+		if (t == PAWN || t == ROOK || t == QUEEN)
+			return true;
+		if (t == KNIGHT || t == BISHOP)
+			minors++;
+	}
+	return minors >= 2;
+}
+
+// for a castling move, the square of the rook it uses (clicking the rook castles too); else -1
+int CastleRookSquare(const Move& m)
+{
+	if (!(m.flags & MF_CASTLE))
+		return -1;
+	int rookFrom, rookTo;
+	ChessRules::CastleRookSquares(m, rookFrom, rookTo);
+	return rookFrom;
+}
+
+bool IsLegalTarget(int to)
+{
+	for (const Move& m : LegalMoves)
+		if (m.from == SelectedSq && (m.to == to || CastleRookSquare(m) == to))
+			return true;
+	return false;
+}
+
+bool HasLegalMoves(int from)
+{
+	for (const Move& m : LegalMoves)
+		if (m.from == from)
+			return true;
+	return false;
+}
+
+// short algebraic-ish text for the HUD, e.g. "Nxf7+", "e8=Q", "O-O"
+// (call after the move has been made on Rules)
+std::string MoveText(const Move& m)
+{
+	std::string s;
+	if (m.flags & MF_CASTLE)
+		s = (m.to > m.from) ? "O-O" : "O-O-O";
+	else
+	{
+		const char* letters = " PNBRQK";
+		int type = (m.flags & MF_PROMOTION) ? PAWN : TypeOf(Rules.board[m.to]);
+		if (type != PAWN)
+			s += letters[type];
+		s += SquareName(m.from);
+		s += (m.flags & MF_CAPTURE) ? "x" : "-";
+		s += SquareName(m.to);
+		if (m.flags & MF_PROMOTION)
+		{
+			s += "=";
+			s += letters[m.promo];
+		}
+	}
+	if (Status == STATUS_CHECKMATE)
+		s += "#";
+	else if (Status == STATUS_CHECK)
+		s += "+";
+	return s;
+}
+
+// after any change to Rules: recompute legal moves and the game status
+void RefreshGameState()
+{
+	Rules.GenerateLegal(LegalMoves);
+	Status = Rules.Status();
+	const Move* last = Rules.LastMove();
+	LastMoveText = last ? MoveText(*last) : "";
+	if (IsGameOver())
+		ClockRunning = false;
+}
+
+// turn the board to face whoever is to move (Auto-Flip option)
+void ApplyAutoFlip()
+{
+	if (AutoFlip)
+		CamYaw = (Rules.side == SIDE_WHITE) ? 0.f : 180.f;
+}
+
+// snap every on-screen piece to match Rules.board (new game, undo)
+void SyncPiecesToBoard()
+{
+	for (Piece& p : Pieces)
+		p = Piece();
+
+	int next[2] = { 0, 16 };	// white pieces use slots 0-15, black 16-31
+	for (int sq = 0; sq < 64; sq++)
+	{
+		PieceAt[sq] = nullptr;
+		int8_t pc = Rules.board[sq];
+		if (pc == 0)
+			continue;
+		int s = SideOf(pc);
+		if (next[s] >= 16 * (s + 1))
+			continue;	// can't happen in a real game -- at most 16 pieces a side
+
+		Piece& p = Pieces[next[s]++];
+		p.type = TypeOf(pc);
+		p.isWhite = (s == SIDE_WHITE);
+		p.square = sq;
+		p.visible = true;
+		p.pos = SquareCenter(sq);
+		PieceAt[sq] = &p;
+	}
+}
+
+#pragma endregion
+
+#pragma region Clock
+
+// m:ss, or s.t in the last ten seconds
+std::string FormatClock(int ms)
+{
+	char buf[16];
+	if (ms < 10000)
+		sprintf(buf, "%d.%d", ms / 1000, (ms % 1000) / 100);
+	else
+	{
+		int secs = (ms + 999) / 1000;
+		sprintf(buf, "%d:%02d", secs / 60, secs % 60);
+	}
+	return buf;
+}
+
+void ResetClock()
+{
+	ClockMs[SIDE_WHITE] = ClockMs[SIDE_BLACK] = TimeControls[TimeControlNow].minutes * 60 * 1000;
+	ClockRunning = false;
+	ClockPaused = false;
+	FlagSide = -1;
+	ClockShown.clear();
+}
+
+// charge the side to move for the time since the last update
+void UpdateClock()
+{
+	int now = glutGet(GLUT_ELAPSED_TIME);
+	if (ClockRunning && !ClockPaused)
+	{
+		int& left = ClockMs[Rules.side];
+		left -= now - ClockLastMs;
+		if (left <= 0)
+		{
+			left = 0;
+			FlagSide = Rules.side;
+			ClockRunning = false;
+			SelectedSq = -1;
+		}
+	}
+	ClockLastMs = now;
+}
+
+int ClockGeneration;	// bumped on every (re)start so a stale timer chain from an old game dies off
+
+// ticks 10x a second while the clock runs, but only redraws when the shown time changes
+void ClockTick(int generation)
+{
+	if (!ClockRunning || generation != ClockGeneration)
+		return;
+	UpdateClock();
+	std::string shown = FormatClock(ClockMs[Rules.side]);
+	if (shown != ClockShown || !ClockRunning)
+	{
+		ClockShown = shown;
+		glutSetWindow(MainWindow);
+		glutPostRedisplay();
+	}
+	if (ClockRunning)
+		glutTimerFunc(100, ClockTick, generation);
+}
+
+// called right after a move is made (UpdateClock ran just before it, while it was still the
+// mover's turn): add the mover's increment and hand the clock to the other side
+void PressClock(int mover)
+{
+	if (!IsTimed() || FlagSide >= 0)
+		return;
+	ClockLastMs = glutGet(GLUT_ELAPSED_TIME);
+	ClockMs[mover] += TimeControls[TimeControlNow].increment * 1000;
+	if (IsGameOver())
+	{
+		ClockRunning = false;
+		return;
+	}
+	if (!ClockRunning)
+	{
+		ClockRunning = true;
+		ClockLastMs = glutGet(GLUT_ELAPSED_TIME);
+		glutTimerFunc(100, ClockTick, ++ClockGeneration);
+	}
+}
+
+#pragma endregion
+
+#pragma region Animation
+
+void StartAnimating()
+{
+	if (Animating || Frozen)
+		return;
+	Animating = true;
+	LastAnimMs = glutGet(GLUT_ELAPSED_TIME);
+	glutIdleFunc(Animate);
+}
+
+void StopAnimating()
+{
+	Animating = false;
+	glutIdleFunc(NULL);
+}
+
+void StartMove(Piece* p, int toSq, int promoteTo, Piece* victim)
+{
+	p->moveFrom = p->pos;
+	p->moveTo = SquareCenter(toSq);
+	float tiles = glm::length(p->moveTo - p->moveFrom) / TILE;
+	p->moveTime = std::min(MOVE_TIME_BASE + MOVE_TIME_PER_TILE * tiles, MOVE_TIME_MAX);
+	p->hop = (p->type == KNIGHT) ? KNIGHT_HOP_HEIGHT : HOP_HEIGHT;
+	p->moveStart = AnimTime;
+	p->promoteTo = promoteTo;
+	p->victim = victim;
+	p->moving = true;
+}
+
+void StartDeath(Piece* victim, const glm::vec3& attackerFrom)
+{
+	// tip over away from whoever took it:
+	glm::vec3 dir = victim->pos - attackerFrom;
+	dir.y = 0.f;
+	if (glm::length(dir) < 0.001f)
+		dir = glm::vec3(0.f, 0.f, 1.f);
+	victim->fallAxis = glm::cross(glm::vec3(0.f, 1.f, 0.f), glm::normalize(dir));
+	victim->deathStart = AnimTime;
+	victim->dying = true;
+}
+
+void UpdatePiece(Piece& p)
+{
+	if (p.moving)
+	{
+		float t = (AnimTime - p.moveStart) / p.moveTime;
+		t = glm::clamp(t, 0.f, 1.f);
+		float ease = t * t * (3.f - 2.f * t);
+		p.pos = glm::mix(p.moveFrom, p.moveTo, ease);
+		p.pos.y = p.hop * 4.f * t * (1.f - t);		// little parabola hop
+
+		if (p.victim != nullptr && !p.victim->dying && t >= CONTACT_FRACTION)
+			StartDeath(p.victim, p.moveFrom);
+
+		if (t >= 1.f)
+		{
+			p.moving = false;
+			p.pos = p.moveTo;
+			if (p.promoteTo != NO_PIECE)
+				p.type = p.promoteTo;
+			p.promoteTo = NO_PIECE;
+			p.victim = nullptr;
+		}
+	}
+
+	if (p.dying)
+	{
+		float d = AnimTime - p.deathStart;
+		p.opacity = (d <= FALL_TIME) ? 1.f : 1.f - (d - FALL_TIME) / FADE_TIME;
+		if (d >= FALL_TIME + FADE_TIME)
+		{
+			p.dying = false;
+			p.visible = false;
+			p.opacity = 0.f;
+		}
+	}
+}
+
+// jump every animation straight to its end (used before undo/new moves)
+void FinishAnimations()
+{
+	for (Piece& p : Pieces)
+	{
+		if (p.moving)
+		{
+			p.moving = false;
+			p.pos = p.moveTo;
+			if (p.promoteTo != NO_PIECE)
+				p.type = p.promoteTo;
+			if (p.victim != nullptr)
+				p.victim->visible = false;
+			p.promoteTo = NO_PIECE;
+			p.victim = nullptr;
+		}
+		if (p.dying)
+		{
+			p.dying = false;
+			p.visible = false;
+		}
+	}
+	StopAnimating();
+}
+
+void FallingTimes()
+{
+	// the original wobbly topple, scaled to FALL_TIME:
+	FallingAnimation.Init();
+	FallingAnimation.AddTimeValue(0.0f, 0.0f);
+	FallingAnimation.AddTimeValue(1.0f / 6.0f * FALL_TIME, 10.0f);
+	FallingAnimation.AddTimeValue(2.0f / 6.0f * FALL_TIME, 45.0f);
+	FallingAnimation.AddTimeValue(3.0f / 6.0f * FALL_TIME, 89.0f);
+	FallingAnimation.AddTimeValue(4.0f / 6.0f * FALL_TIME, 76.0f);
+	FallingAnimation.AddTimeValue(5.0f / 6.0f * FALL_TIME, 89.0f);
+	FallingAnimation.AddTimeValue(11.0f / 12.0f * FALL_TIME, 85.0f);
+	FallingAnimation.AddTimeValue(FALL_TIME, 90.0f);
+}
+
 // this is where one would put code that is to be called
 // everytime the glut main loop has nothing to do
 //
-// this is typically where animation parameters are set
+// the idle function is only installed while pieces are moving,
+// so the program sits at ~0% cpu when the board is still
 //
 // do not call Display( ) from here -- let glutPostRedisplay( ) do it
 void
 Animate( )
 {
-	// put animation stuff in here -- change some global variables for Display( ) to find:
-
 	int ms = glutGet(GLUT_ELAPSED_TIME);
-	elapsedALLTIME = ms/(float)(100);
-	ms %= (MSEC);
-	Time = (float)ms / (float)(MSEC);
+	float dt = (ms - LastAnimMs) / 1000.f;
+	LastAnimMs = ms;
+	if (!Frozen)
+		AnimTime += dt;
 
-	Piece* cp = chess.doIMovePiece();
-	if (cp != nullptr)
+	bool busy = false;
+	for (Piece& p : Pieces)
 	{
-		if (chess.secondPieceSel != nullptr) {
-			if (!chess.secondPieceSel->isDying && cp->IsAboutToKill())
-			{
-				chess.secondPieceSel->startDeathAnimation();
-			}
-		}
-		cp->makeMoves();
+		UpdatePiece(p);
+		busy = busy || p.Busy();
+	}
+	if (!busy)
+	{
+		StopAnimating();
+		ApplyAutoFlip();	// turn the board only once the pieces have landed
 	}
 
 	glutSetWindow( MainWindow );
 	glutPostRedisplay( );
 }
 
-#pragma region callMethods
-void callLight()
-{
-	// Get the interpolated light angle value for the current time
-	LightAngle = LightAngleKT.GetValue(nowTime);
-
-	// Convert the angle to a position
-	xLightPos = LIGHT_RADIUS * cos(LightAngle);
-	zLightPos = LIGHT_RADIUS * sin(LightAngle);
-
-	// Apply light position for rendering
-	glEnable(GL_LIGHTING);
-	glEnable(GL_LIGHT0);
-
-
-	if (isSpotLight) {
-		SetSpotLight(GL_LIGHT0, xLightPos, LIGHT_HEIGHT, zLightPos, 0.0f, -1.0f, .0f, Colors[LightColorNow][0], Colors[LightColorNow][1], Colors[LightColorNow][2]);
-	}
-	else {
-		SetPointLight(GL_LIGHT0, xLightPos, LIGHT_HEIGHT, zLightPos, Colors[LightColorNow][0], Colors[LightColorNow][1], Colors[LightColorNow][2]);
-	}
-}
-
-void callPieces()
-{
-	for (int type = PAWN; type < KNIGHT; type++)
-	{
-		// Initialize white pieces of this type
-		for (Piece& whitePiece : chess.WhitePieces) {
-			if (!whitePiece.isDead)
-			{
-				whitePiece.callSelf();
-				if (DebugOn != 0)
-				{
-					whitePiece.callBox();
-				}
-			}
-		}
-		// Initialize black pieces of this type
-		for (Piece& blackPiece : chess.BlackPieces) {
-			if (!blackPiece.isDead) {
-				blackPiece.callSelf();
-				if (DebugOn != 0)
-				{
-					blackPiece.callBox();
-				}
-			}
-		}
-	}
-}
-
-void callPawn(float x, float y, float z) {
-	glPushMatrix(); // Save the current matrix state
-
-
-	glTranslatef(x, y, z);
-
-	glScalef(1.f, 1.f, 1.f);
-
-	glColor3f(0.f, 0.f, 0.0f);
-	glCallList(PawnList);
-
-	glPopMatrix(); // Restore the previous matrix state
-}
 #pragma endregion
 
-void
-AnimateLight() {
-	LightAngle = LightAngleKT.GetValue(nowTime); // Get interpolated angle
+#pragma region Moves And Selection
 
-	xLightPos = LIGHT_RADIUS * cos(LightAngle);
-	zLightPos = LIGHT_RADIUS * sin(LightAngle);
+void PlayMove(const Move& m)
+{
+	FinishAnimations();
+
+	// settle the clock while it is still the mover's turn -- they may have just run out:
+	if (IsTimed())
+	{
+		UpdateClock();
+		if (FlagSide >= 0)
+			return;
+	}
+	int moverSide = Rules.side;
+
+	Piece* mover = PieceAt[m.from];
+	Piece* victim = nullptr;
+	if (m.flags & MF_ENPASSANT)
+		victim = PieceAt[m.to + (mover->isWhite ? -8 : 8)];
+	else if (m.flags & MF_CAPTURE)
+		victim = PieceAt[m.to];
+
+	if (victim != nullptr)
+	{
+		PieceAt[victim->square] = nullptr;
+		victim->square = -1;
+	}
+
+	PieceAt[m.from] = nullptr;
+	PieceAt[m.to] = mover;
+	mover->square = m.to;
+	StartMove(mover, m.to, (m.flags & MF_PROMOTION) ? m.promo : NO_PIECE, victim);
+
+	if (m.flags & MF_CASTLE)
+	{
+		int rookFrom, rookTo;
+		ChessRules::CastleRookSquares(m, rookFrom, rookTo);
+		Piece* rook = PieceAt[rookFrom];
+		PieceAt[rookFrom] = nullptr;
+		PieceAt[rookTo] = rook;
+		rook->square = rookTo;
+		StartMove(rook, rookTo, NO_PIECE, nullptr);
+	}
+
+	Rules.MakeMove(m);
+	SelectedSq = -1;
+	PendingPromoFrom = PendingPromoTo = -1;
+	RefreshGameState();
+	PressClock(moverSide);
+	StartAnimating();
+
+	if (DebugOn != 0)
+		fprintf(stderr, "%s\n", LastMoveText.c_str());
 }
+
+void HandleClick(int sq)
+{
+	if (DebugOn != 0)
+		fprintf(stderr, "click %s\n", sq >= 0 ? SquareName(sq).c_str() : "off board");
+
+	if (IsGameOver() || ClockPaused)
+		return;
+
+	// a click anywhere cancels a pending promotion choice:
+	PendingPromoFrom = PendingPromoTo = -1;
+
+	if (SelectedSq >= 0 && sq >= 0)
+	{
+		// legal moves list queens first, so a promotion defaults to a queen:
+		for (const Move& m : LegalMoves)
+		{
+			if (m.from == SelectedSq && (m.to == sq || CastleRookSquare(m) == sq))
+			{
+				if ((m.flags & MF_PROMOTION) && ChoosePromotion)
+				{
+					// wait for 1-4 to pick the piece:
+					PendingPromoFrom = m.from;
+					PendingPromoTo = m.to;
+					return;
+				}
+				PlayMove(m);
+				return;
+			}
+		}
+		if (DebugOn != 0 && sq != SelectedSq)
+			fprintf(stderr, "not legal: %s-%s\n", SquareName(SelectedSq).c_str(), SquareName(sq).c_str());
+	}
+
+	// otherwise (re)select one of the mover's own pieces, or clear the selection:
+	bool ownPiece = sq >= 0 && Rules.board[sq] != 0 && SideOf(Rules.board[sq]) == Rules.side;
+	SelectedSq = (ownPiece && sq != SelectedSq) ? sq : -1;
+}
+
+// 1-4 while a promotion is pending: queen, rook, bishop, knight
+void ChoosePromotionPiece(int type)
+{
+	if (ClockPaused || IsGameOver())
+		return;
+	for (const Move& m : LegalMoves)
+	{
+		if (m.from == PendingPromoFrom && m.to == PendingPromoTo && m.promo == type)
+		{
+			PlayMove(m);
+			return;
+		}
+	}
+}
+
+#pragma endregion
 
 #pragma region CameraSet
 
-void UpdateCamera() {
-	// Set view matrix using the camera position, target, and up vector:
-	viewMatrix = glm::lookAt(cameraPos, cameraTarget, upVector);
-
-	aspectRatio = (float)glutGet(GLUT_WINDOW_WIDTH) / (float)glutGet(GLUT_WINDOW_HEIGHT);
-
-	float adjustedFOV = glm::radians(fov) / Scale;
-	adjustedFOV = glm::clamp(adjustedFOV, glm::radians(1.0f), glm::radians(179.0f)); // Clamp to valid range
-	projMatrix = glm::perspective(adjustedFOV, aspectRatio, 0.1f, 1000.f);
-}
-
-void defineCamera() {
-	// set the viewport to be a square centered in the window :
-
+// build the view and projection matrices once, and use them for both drawing
+// and picking so a click always lands where it looks like it does
+void UpdateMatrices()
+{
+	// the viewport is a square centered in the window:
 	GLsizei vx = glutGet(GLUT_WINDOW_WIDTH);
 	GLsizei vy = glutGet(GLUT_WINDOW_HEIGHT);
 	GLsizei v = vx < vy ? vx : vy;			// minimum dimension
 	GLint xl = (vx - v) / 2;
 	GLint yb = (vy - v) / 2;
+	Viewport = glm::vec4(xl, yb, v, v);
 
+	float pitch = glm::radians(CamPitch);
+	float yaw = glm::radians(CamYaw);
+	CamEye = CamDist * glm::vec3(cos(pitch) * sin(yaw), sin(pitch), cos(pitch) * cos(yaw));
+	ViewMatrix = glm::lookAt(CamEye, glm::vec3(0.f), glm::vec3(0.f, 1.f, 0.f));
 
-	glViewport(xl, yb, v, v);
-
-
-	// set the viewing volume:
-	// remember that the Z clipping  values are given as DISTANCES IN FRONT OF THE EYE
-	// USE gluOrtho2D( ) IF YOU ARE DOING 2D !
-
-	glMatrixMode(GL_PROJECTION);
-	glLoadIdentity();
-	aspectRatio = (float)vx / (float)vy;
 	if (NowProjection == ORTHO)
 	{
-		glOrtho(-2.f, 2.f, -2.f, 2.f, 0.1f, 1000.f);
-		projMatrix = glm::ortho(-2.f, 2.f, -2.f, 2.f, 0.1f, 1000.f);
+		float h = CamDist * tan(glm::radians(CAM_FOV / 2.f));	// same framing as perspective
+		ProjMatrix = glm::ortho(-h, h, -h, h, 1.f, 3000.f);
 	}
 	else
-	{
-		float adjustedFOV = glm::radians(fov) / Scale;
-		adjustedFOV = glm::clamp(adjustedFOV, glm::radians(1.0f), glm::radians(179.0f)); // Clamp to valid range
+		ProjMatrix = glm::perspective(glm::radians(CAM_FOV), 1.f, 1.f, 3000.f);
+}
 
-		gluPerspective(fov, aspectRatio, 0.1f, 1000.f);
-		projMatrix = glm::perspective(adjustedFOV, aspectRatio, 0.1f, 1000.f);
-	}
-
-	// Set view matrix:
-	glMatrixMode(GL_MODELVIEW);
-	glLoadIdentity();
-	gluLookAt(cameraPos.x, cameraPos.y, cameraPos.z, cameraTarget.x, cameraTarget.y, cameraTarget.z, upVector.x, upVector.y, upVector.z);
-	viewMatrix = glm::lookAt(cameraPos, cameraTarget, upVector);
-
-	// Rotate the scene:
-	glRotatef((GLfloat)Yrot, 0.f, 1.f, 0.f);
-	glRotatef((GLfloat)Xrot, 1.f, 0.f, 0.f);
-
-	// Uniformly scale the scene:
-	if (Scale < minFov)
-	{
-		Scale = minFov;
-	}
-	glScalef((GLfloat)Scale, (GLfloat)Scale, (GLfloat)Scale);
+void SetView(int view)
+{
+	CamDist = CAM_DIST;
+	CamPitch = (view == VIEW_TOP) ? CAM_PITCH_MAX : CAM_PITCH;
+	CamYaw = (view == VIEW_BLACK) ? 180.f : 0.f;
 }
 
 #pragma endregion
+
+#pragma region Picking
+
+bool RayHitsBox(const glm::vec3& o, const glm::vec3& d, const glm::vec3& bmin, const glm::vec3& bmax, float& tHit)
+{
+	glm::vec3 invDir = 1.0f / d;
+	glm::vec3 t0s = (bmin - o) * invDir;
+	glm::vec3 t1s = (bmax - o) * invDir;
+	glm::vec3 tmin = glm::min(t0s, t1s);
+	glm::vec3 tmax = glm::max(t0s, t1s);
+	float tnear = glm::max(glm::max(tmin.x, tmin.y), tmin.z);
+	float tfar = glm::min(glm::min(tmax.x, tmax.y), tmax.z);
+	if (tfar < 0.f || tnear > tfar)
+		return false;
+	tHit = tnear;
+	return true;
+}
+
+// Moller-Trumbore ray/triangle test against the piece's actual mesh, so clicks go through
+// the empty corners of its bounding box (pieces taper, boxes don't)
+bool RayHitsModel(const glm::vec3& o, const glm::vec3& d, const Piece& p, const glm::vec3& base, float& tHit)
+{
+	// into the model's own coordinates -- black pieces are drawn turned 180 degrees about y:
+	glm::vec3 lo = o - base, ld = d;
+	if (!p.isWhite)
+	{
+		lo = glm::vec3(-lo.x, lo.y, -lo.z);
+		ld = glm::vec3(-ld.x, ld.y, -ld.z);
+	}
+
+	const std::vector<glm::vec3>& tris = PieceTris[p.type];
+	float best = 1.e+37f;
+	for (size_t i = 0; i + 2 < tris.size(); i += 3)
+	{
+		glm::vec3 e1 = tris[i + 1] - tris[i];
+		glm::vec3 e2 = tris[i + 2] - tris[i];
+		glm::vec3 pv = glm::cross(ld, e2);
+		float det = glm::dot(e1, pv);
+		if (fabs(det) < 1.e-8f)
+			continue;
+		float inv = 1.f / det;
+		glm::vec3 tv = lo - tris[i];
+		float u = glm::dot(tv, pv) * inv;
+		if (u < 0.f || u > 1.f)
+			continue;
+		glm::vec3 qv = glm::cross(tv, e1);
+		float v = glm::dot(ld, qv) * inv;
+		if (v < 0.f || u + v > 1.f)
+			continue;
+		float t = glm::dot(e2, qv) * inv;
+		if (t > 0.f && t < best)
+			best = t;
+	}
+	if (best >= 1.e+37f)
+		return false;
+	tHit = best;
+	return true;
+}
+
+void MouseRay(int x, int y, glm::vec3& origin, glm::vec3& dir)
+{
+	UpdateMatrices();
+	float winY = (float)(glutGet(GLUT_WINDOW_HEIGHT) - y);	// glut y runs top-down, OpenGL bottom-up
+	glm::vec3 nearPt = glm::unProject(glm::vec3((float)x, winY, 0.f), ViewMatrix, ProjMatrix, Viewport);
+	glm::vec3 farPt = glm::unProject(glm::vec3((float)x, winY, 1.f), ViewMatrix, ProjMatrix, Viewport);
+	origin = nearPt;
+	dir = glm::normalize(farPt - nearPt);
+}
+
+// which square is under the mouse? the nearest piece wins, then the board itself
+int PickSquare(int x, int y)
+{
+	glm::vec3 o, d;
+	MouseRay(x, y, o, d);
+	if (DebugOn != 0)
+	{
+		RayOrigin = o;
+		RayDir = d;
+		HaveRay = true;
+	}
+
+	float best = 1.e+37f;
+	int bestSq = -1;
+
+	if (fabs(d.y) > 1.e-6f)
+	{
+		float t = -o.y / d.y;
+		if (t > 0.f)
+		{
+			glm::vec3 hit = o + t * d;
+			int f = (int)floor(hit.x / TILE + 4.f);
+			int r = (int)floor(4.f - hit.z / TILE);
+			if (OnBoard(f, r))
+			{
+				best = t;
+				bestSq = MakeSquare(f, r);
+			}
+		}
+	}
+
+	for (const Piece& p : Pieces)
+	{
+		if (!p.visible || p.square < 0)
+			continue;
+		glm::vec3 base = p.pos;
+		if (p.square == SelectedSq)
+			base.y += SELECTED_LIFT;
+		float t;
+		if (!RayHitsBox(o, d, base + PieceMin[p.type], base + PieceMax[p.type], t) || t >= best)
+			continue;	// quick reject: can't hit this piece, or something nearer is already hit
+		if (RayHitsModel(o, d, p, base, t) && t < best)
+		{
+			best = t;
+			bestSq = p.square;
+		}
+	}
+	return bestSq;
+}
+
+#pragma endregion
+
+#pragma region Draw
+
+void SetPieceMaterial(bool white, float alpha)
+{
+	// with lighting on, glColor is ignored -- alpha has to go through the material:
+	float c = white ? 1.f : 0.f;
+	GLfloat color[4] = { c, c, c, alpha };
+	GLfloat spec[4] = { .8f, .8f, .8f, alpha };
+	GLfloat none[4] = { 0.f, 0.f, 0.f, alpha };
+	glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, none);
+	glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, color);
+	glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, color);
+	glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, spec);
+	glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 70.f);
+}
+
+void DrawPiece(const Piece& p)
+{
+	glPushMatrix();
+	glTranslatef(p.pos.x, p.pos.y, p.pos.z);
+	if (p.square >= 0 && p.square == SelectedSq)
+		glTranslatef(0.f, SELECTED_LIFT, 0.f);
+	if (p.dying)
+	{
+		float angle = FallingAnimation.GetValue(std::min(AnimTime - p.deathStart, FALL_TIME));
+		glRotatef(angle, p.fallAxis.x, p.fallAxis.y, p.fallAxis.z);
+	}
+	if (!p.isWhite)
+		glRotatef(180.f, 0.f, 1.f, 0.f);	// knights face each other
+	SetPieceMaterial(p.isWhite, p.opacity);
+	glCallList(PieceLists[p.type]);
+	glPopMatrix();
+}
+
+void DrawPieces()
+{
+	glEnable(GL_LIGHTING);
+
+	// solid pieces first, then fading ones on top without writing depth:
+	for (const Piece& p : Pieces)
+		if (p.visible && p.opacity >= 1.f)
+			DrawPiece(p);
+
+	glDepthMask(GL_FALSE);
+	for (const Piece& p : Pieces)
+		if (p.visible && p.opacity < 1.f)
+			DrawPiece(p);
+	glDepthMask(GL_TRUE);
+
+	glDisable(GL_LIGHTING);
+}
+
+// a flat square over a board square, scaled to 'size' of a tile
+void SquareQuad(int sq, float size)
+{
+	glm::vec3 c = SquareCenter(sq);
+	float h = 0.5f * TILE * size;
+	glBegin(GL_QUADS);
+	glVertex3f(c.x - h, HIGHLIGHT_Y, c.z - h);
+	glVertex3f(c.x - h, HIGHLIGHT_Y, c.z + h);
+	glVertex3f(c.x + h, HIGHLIGHT_Y, c.z + h);
+	glVertex3f(c.x + h, HIGHLIGHT_Y, c.z - h);
+	glEnd();
+}
+
+// a hollow square frame around the edge of a board square
+void SquareFrame(int sq, float thickness)
+{
+	glm::vec3 c = SquareCenter(sq);
+	float h = 0.5f * TILE;
+	float t = TILE * thickness;
+	float x0 = c.x - h, x1 = c.x + h, z0 = c.z - h, z1 = c.z + h;
+	glBegin(GL_QUADS);
+	glVertex3f(x0, HIGHLIGHT_Y, z0);	glVertex3f(x0, HIGHLIGHT_Y, z0 + t);	glVertex3f(x1, HIGHLIGHT_Y, z0 + t);	glVertex3f(x1, HIGHLIGHT_Y, z0);
+	glVertex3f(x0, HIGHLIGHT_Y, z1 - t);	glVertex3f(x0, HIGHLIGHT_Y, z1);	glVertex3f(x1, HIGHLIGHT_Y, z1);	glVertex3f(x1, HIGHLIGHT_Y, z1 - t);
+	glVertex3f(x0, HIGHLIGHT_Y, z0);	glVertex3f(x0, HIGHLIGHT_Y, z1);	glVertex3f(x0 + t, HIGHLIGHT_Y, z1);	glVertex3f(x0 + t, HIGHLIGHT_Y, z0);
+	glVertex3f(x1 - t, HIGHLIGHT_Y, z0);	glVertex3f(x1 - t, HIGHLIGHT_Y, z1);	glVertex3f(x1, HIGHLIGHT_Y, z1);	glVertex3f(x1, HIGHLIGHT_Y, z0);
+	glEnd();
+}
+
+void DrawHighlights()
+{
+	glDisable(GL_LIGHTING);
+
+	const Move* last = Rules.LastMove();
+	if (last != nullptr)
+	{
+		glColor4f(0.85f, 0.65f, 0.15f, 0.45f);
+		SquareQuad(last->from, 1.f);
+		SquareQuad(last->to, 1.f);
+	}
+
+	if (Status == STATUS_CHECK || Status == STATUS_CHECKMATE)
+	{
+		glColor4f(0.9f, 0.1f, 0.1f, 0.75f);
+		SquareQuad(Rules.KingSquare(Rules.side), 1.f);
+	}
+
+	if (SelectedSq >= 0)
+	{
+		glColor4f(1.f, 0.85f, 0.1f, 0.8f);
+		SquareQuad(SelectedSq, 1.f);
+
+		for (const Move& m : LegalMoves)
+		{
+			if (!ShowHints || m.from != SelectedSq)
+				continue;
+			if (m.flags & MF_CAPTURE)
+			{
+				glColor4f(0.9f, 0.25f, 0.2f, 0.9f);
+				SquareFrame(m.to, 0.12f);
+			}
+			else
+			{
+				glColor4f(0.2f, 0.8f, 0.3f, 0.9f);
+				SquareQuad(m.to, 0.28f);
+				if (m.flags & MF_CASTLE)
+					SquareFrame(CastleRookSquare(m), 0.12f);	// the rook can be clicked to castle
+			}
+		}
+	}
+
+	// hover outline only where a click would do something:
+	bool hoverUseful = ShowHints && HoverSq >= 0 && !IsGameOver() &&
+		((SelectedSq >= 0 && IsLegalTarget(HoverSq)) || HasLegalMoves(HoverSq));
+	if (hoverUseful)
+	{
+		glColor4f(0.3f, 0.8f, 1.f, 0.9f);
+		SquareFrame(HoverSq, 0.06f);
+	}
+}
+
+// one pixel-font character centered on a world position (always faces the screen)
+void WorldChar(const glm::vec3& p, char c)
+{
+	glRasterPos3f(p.x, p.y, p.z);
+	glBitmap(0, 0, 0.f, 0.f, -4.5f, -5.f, NULL);	// nudge so the 9x15 glyph is centered
+	glutBitmapCharacter(GLUT_BITMAP_9_BY_15, c);
+}
+
+// a-h along the white and black edges, 1-8 along both sides:
+void DrawCoordinates()
+{
+	// the glyphs are coplanar with the border, so skip the depth test (it would chew
+	// them up); pieces are drawn afterward and still cover any label they stand in front of
+	glDisable(GL_LIGHTING);
+	glDisable(GL_DEPTH_TEST);
+	glColor3f(0.9f, 0.85f, 0.7f);
+	float out = 4.f * TILE + 0.5f * BORDER;		// middle of the border strip
+	for (int i = 0; i < 8; i++)
+	{
+		float along = (i - 3.5f) * TILE;
+		WorldChar(glm::vec3(along, 0.f,  out), (char)('a' + i));
+		WorldChar(glm::vec3(along, 0.f, -out), (char)('a' + i));
+		WorldChar(glm::vec3(-out, 0.f, -along), (char)('1' + i));
+		WorldChar(glm::vec3( out, 0.f, -along), (char)('1' + i));
+	}
+	glEnable(GL_DEPTH_TEST);
+}
+
+void DrawBoundingBox(const glm::vec3& min, const glm::vec3& max)
+{
+	glBegin(GL_LINE_LOOP);
+	glVertex3f(min.x, min.y, min.z);
+	glVertex3f(max.x, min.y, min.z);
+	glVertex3f(max.x, max.y, min.z);
+	glVertex3f(min.x, max.y, min.z);
+	glEnd();
+
+	glBegin(GL_LINE_LOOP);
+	glVertex3f(min.x, min.y, max.z);
+	glVertex3f(max.x, min.y, max.z);
+	glVertex3f(max.x, max.y, max.z);
+	glVertex3f(min.x, max.y, max.z);
+	glEnd();
+
+	glBegin(GL_LINES);
+	glVertex3f(min.x, min.y, min.z);
+	glVertex3f(min.x, min.y, max.z);
+	glVertex3f(max.x, min.y, min.z);
+	glVertex3f(max.x, min.y, max.z);
+	glVertex3f(max.x, max.y, min.z);
+	glVertex3f(max.x, max.y, max.z);
+	glVertex3f(min.x, max.y, min.z);
+	glVertex3f(min.x, max.y, max.z);
+	glEnd();
+}
+
+void DrawDebug()
+{
+	glDisable(GL_LIGHTING);
+	glColor3f(1.f, 0.f, 0.f);
+	for (const Piece& p : Pieces)
+		if (p.visible && p.square >= 0)
+			DrawBoundingBox(p.pos + PieceMin[p.type], p.pos + PieceMax[p.type]);
+
+	if (HaveRay)
+	{
+		glm::vec3 end = RayOrigin + RayDir * 3000.f;
+		glBegin(GL_LINES);
+		glVertex3f(RayOrigin.x, RayOrigin.y, RayOrigin.z);
+		glVertex3f(end.x, end.y, end.z);
+		glEnd();
+	}
+}
+
+// pixel font text with a 1-step drop shadow, in 0-100 "percent" screen units
+void HudText(float x, float y, const std::string& s, float r, float g, float b)
+{
+	glColor3f(0.f, 0.f, 0.f);
+	DoRasterString(x + 0.25f, y - 0.25f, 0.f, (char*)s.c_str());
+	glColor3f(r, g, b);
+	DoRasterString(x, y, 0.f, (char*)s.c_str());
+}
+
+void DrawHud()
+{
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_LIGHTING);
+	glMatrixMode(GL_PROJECTION);
+	glLoadIdentity();
+	gluOrtho2D(0.f, 100.f, 0.f, 100.f);
+	glMatrixMode(GL_MODELVIEW);
+	glLoadIdentity();
+
+	std::string mover = (Rules.side == SIDE_WHITE) ? "WHITE" : "BLACK";
+	std::string other = (Rules.side == SIDE_WHITE) ? "BLACK" : "WHITE";
+	std::string line;
+	float r = 1.f, g = 1.f, b = 1.f;
+	switch (Status)
+	{
+	case STATUS_PLAYING:		line = mover + " TO MOVE"; break;
+	case STATUS_CHECK:			line = mover + " TO MOVE - CHECK!"; r = 1.f; g = 0.35f; b = 0.3f; break;
+	case STATUS_CHECKMATE:		line = "CHECKMATE - " + other + " WINS   [N] NEW GAME"; r = 1.f; g = 0.85f; b = 0.1f; break;
+	case STATUS_STALEMATE:		line = "STALEMATE - DRAW   [N] NEW GAME"; r = 0.6f; g = 0.9f; b = 1.f; break;
+	case STATUS_DRAW_FIFTY:		line = "DRAW - FIFTY MOVE RULE   [N] NEW GAME"; r = 0.6f; g = 0.9f; b = 1.f; break;
+	case STATUS_DRAW_MATERIAL:	line = "DRAW - NOT ENOUGH MATERIAL   [N] NEW GAME"; r = 0.6f; g = 0.9f; b = 1.f; break;
+	}
+	if (FlagSide >= 0)
+	{
+		std::string flagged = (FlagSide == SIDE_WHITE) ? "WHITE" : "BLACK";
+		std::string winner = (FlagSide == SIDE_WHITE) ? "BLACK" : "WHITE";
+		if (HasMatingMaterial(FlagSide ^ 1))
+			line = flagged + " OUT OF TIME - " + winner + " WINS";
+		else
+			line = flagged + " OUT OF TIME - DRAW";
+		r = 1.f; g = 0.85f; b = 0.1f;
+	}
+	HudText(2.f, 96.f, line, r, g, b);
+
+	if (!LastMoveText.empty())
+		HudText(2.f, 92.5f, "LAST: " + LastMoveText, 0.85f, 0.85f, 0.85f);
+
+	if (PendingPromoTo >= 0)
+		HudText(2.f, 89.f, "PROMOTE TO: [1] QUEEN [2] ROOK [3] BISHOP [4] KNIGHT", 1.f, 0.85f, 0.1f);
+
+	// clocks, top right -- the side to move is bright, under 10 seconds turns red:
+	if (IsTimed())
+	{
+		for (int s = SIDE_WHITE; s <= SIDE_BLACK; s++)
+		{
+			bool active = (s == Rules.side) && !IsGameOver();
+			float cr = active ? 1.f : 0.6f, cg = active ? 1.f : 0.6f, cb = active ? 1.f : 0.6f;
+			if (ClockMs[s] < 10000)
+			{
+				cr = 1.f; cg = 0.3f; cb = 0.3f;
+			}
+			std::string label = (s == SIDE_WHITE) ? "WHITE " : "BLACK ";
+			HudText(76.f, (s == SIDE_BLACK) ? 96.f : 92.5f, (active ? ">" : " ") + label + FormatClock(ClockMs[s]), cr, cg, cb);
+		}
+		if (ClockPaused)
+			HudText(76.f, 89.f, " PAUSED [P]", 0.6f, 0.9f, 1.f);
+	}
+
+	if (Frozen)
+		HudText(2.f, 85.5f, "ANIMATION FROZEN [F]", 0.6f, 0.9f, 1.f);
+
+	if (IsTimed())
+		HudText(2.f, 2.f, "[N]EW [P]AUSE [V]IEW  SHIFT+DRAG/ARROWS ORBIT  WHEEL ZOOM", 0.75f, 0.75f, 0.75f);
+	else
+		HudText(2.f, 2.f, "[N]EW [U]NDO [V]IEW  SHIFT+DRAG/ARROWS ORBIT  WHEEL ZOOM", 0.75f, 0.75f, 0.75f);
+}
 
 // draw the complete scene:
 void
 Display( )
 {
-	/*if (DebugOn != 0)
-		fprintf(stderr, "Starting Display.\n");*/
-	int ms = glutGet(GLUT_ELAPSED_TIME);
-	ms %= MSEC;
-	nowTime = (float)ms / 10000.0f;
-
 	// set which window we want to do the graphics into:
 	glutSetWindow( MainWindow );
 
 	// erase the background:
 	glDrawBuffer( GL_BACK );
 	glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
-
 	glEnable( GL_DEPTH_TEST );
-#ifdef DEMO_DEPTH_BUFFER
-	if( DepthBufferOn == 0 )
-		glDisable( GL_DEPTH_TEST );
-#endif
 
-
-	// specify shading to be flat:
-
+	// flat shading keeps the low-poly, pixelly look:
 	glShadeModel( GL_FLAT );
 
-	defineCamera();
+	UpdateMatrices();
+	glViewport((GLint)Viewport.x, (GLint)Viewport.y, (GLsizei)Viewport.z, (GLsizei)Viewport.w);
+	glMatrixMode(GL_PROJECTION);
+	glLoadMatrixf(glm::value_ptr(ProjMatrix));
+	glMatrixMode(GL_MODELVIEW);
+	glLoadMatrixf(glm::value_ptr(ViewMatrix));
 
-	if (DebugOn != 0 && rayDir != glm::vec3(69))
-	{
-		RenderRay();
-	}
 	// set the fog parameters:
-
 	if( DepthCueOn != 0 )
 	{
-		glFogi( GL_FOG_MODE, FOGMODE );
+		const GLfloat FOGCOLOR[4] = { GRAY[0], GRAY[1], GRAY[2], 1.f };
+		glFogi( GL_FOG_MODE, GL_LINEAR );
 		glFogfv( GL_FOG_COLOR, FOGCOLOR );
-		glFogf( GL_FOG_DENSITY, FOGDENSITY );
-		glFogf( GL_FOG_START, FOGSTART );
-		glFogf( GL_FOG_END, FOGEND );
+		glFogf( GL_FOG_START, CamDist - 100.f );
+		glFogf( GL_FOG_END, CamDist + 250.f );
 		glEnable( GL_FOG );
 	}
 	else
@@ -1699,81 +1421,34 @@ Display( )
 		glDisable( GL_FOG );
 	}
 
-	callLight();
+	// the light is placed after the view matrix so it stays put in the world:
+	const GLfloat* lc = Colors[LightColorNow];
+	if (isSpotLight)
+		SetSpotLight(GL_LIGHT0, LIGHT_RADIUS, LIGHT_HEIGHT, 0.f, 0.f, -1.f, 0.f, lc[0], lc[1], lc[2]);
+	else
+		SetPointLight(GL_LIGHT0, LIGHT_RADIUS, LIGHT_HEIGHT, 0.f, lc[0], lc[1], lc[2]);
+	glEnable( GL_NORMALIZE );
 
-
+	glDisable(GL_LIGHTING);
 	if( AxesOn != 0 )
 	{
 		glColor3fv( &Colors[NowColor][0] );
 		glCallList( AxesList );
 	}
 
-
-	glEnable( GL_NORMALIZE );
-
-	//glPushAttrib(GL_CURRENT_BIT); // Save the current color
-	//glColor3f(0.5f, 0.5f, 0.5f);
-	//glCallList(GridList);
-	//glPopAttrib(); // Restore the previous color
-
-
-	if (TextureType)
-		glEnable(GL_TEXTURE_2D);
-	else
-		glDisable(GL_TEXTURE_2D);
-
-	glEnable(GL_LIGHTING);
-	glEnable(GL_LIGHT0);
-	
-	if (LightMode)
-		glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-	else
-		glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-
-	// Enable blending
 	glEnable(GL_BLEND);
 	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-	
-	callPieces();
+	glCallList(BoardList);
+	DrawCoordinates();
+	DrawHighlights();
+	DrawPieces();
 
-	chess.board.callBoard();
-	
-	glDisable(GL_TEXTURE_2D);
-	glDisable(GL_LIGHTING);
+	if (DebugOn != 0)
+		DrawDebug();
 
-
-#ifdef DEMO_Z_FIGHTING
-	if( DepthFightingOn != 0 )
-	{
-		glPushMatrix( );
-			glRotatef( 90.f,   0.f, 1.f, 0.f );
-			glCallList( BoxList );
-		glPopMatrix( );
-	}
-#endif
-
-	glDisable( GL_DEPTH_TEST );
-	glColor3f( 0.f, 1.f, 1.f );
-	//DoRasterString( 0.f, 1.f, 0.f, (char *)"Text That Moves" );
-
-
-	// draw some gratuitous text that is fixed on the screen:
-	//
-	// the projection matrix is reset to define a scene whose
-	// world coordinate system goes from 0-100 in each axis
-	//
-	// this is called "percent units", and is just a convenience
-	//
-	// the modelview matrix is reset to identity as we don't
-	// want to transform these coordinates
-	glDisable( GL_DEPTH_TEST );
-	glMatrixMode( GL_PROJECTION );
-	glLoadIdentity( );
-	gluOrtho2D( 0.f, 100.f,     0.f, 100.f );
-	glMatrixMode( GL_MODELVIEW );
-	glLoadIdentity( );
-	glColor3f( 1.f, 1.f, 1.f );
+	glDisable(GL_FOG);
+	DrawHud();
 
 	// swap the double-buffered framebuffers:
 	glutSwapBuffers( );
@@ -1783,11 +1458,9 @@ Display( )
 	glFlush( );
 }
 
+#pragma endregion
+
 #pragma region MenuMethods
-void SetCameraView(int view) {
-	CurrentView = view;
-	glutPostRedisplay();
-}
 
 void
 DoAxesMenu( int id )
@@ -1813,26 +1486,7 @@ void
 DoDebugMenu( int id )
 {
 	DebugOn = id;
-
-	glutSetWindow( MainWindow );
-	glutPostRedisplay( );
-}
-
-
-void
-DoDepthBufferMenu( int id )
-{
-	DepthBufferOn = id;
-
-	glutSetWindow( MainWindow );
-	glutPostRedisplay( );
-}
-
-
-void
-DoDepthFightingMenu( int id )
-{
-	DepthFightingOn = id;
+	HaveRay = false;
 
 	glutSetWindow( MainWindow );
 	glutPostRedisplay( );
@@ -1859,6 +1513,35 @@ DoMainMenu( int id )
 			Reset( );
 			break;
 
+		case NEW_GAME:
+			if( DebugOn != 0 )
+				fprintf( stderr, "--- new game ---\n" );
+			FinishAnimations( );
+			Rules.Reset( );
+			SyncPiecesToBoard( );
+			SelectedSq = -1;
+			PendingPromoFrom = PendingPromoTo = -1;
+			ResetClock( );
+			RefreshGameState( );
+			ApplyAutoFlip( );
+			break;
+
+		case UNDO:
+			// no take-backs against the clock:
+			FinishAnimations( );
+			if( Rules.CanUndo( ) && !IsTimed( ) )
+			{
+				if( DebugOn != 0 )
+					fprintf( stderr, "undo %s\n", LastMoveText.c_str( ) );
+				Rules.UnmakeMove( );
+				SyncPiecesToBoard( );
+				SelectedSq = -1;
+				PendingPromoFrom = PendingPromoTo = -1;
+				RefreshGameState( );
+				ApplyAutoFlip( );
+			}
+			break;
+
 		case QUIT:
 			// gracefully close out the graphics:
 			// gracefully close the graphics window:
@@ -1881,13 +1564,86 @@ DoMainMenu( int id )
 void
 DoProjectMenu( int id )
 {
-	if (CurrentView != INSIDE_OUT)
-	{
-		NowProjection = id;
+	NowProjection = id;
 
-		glutSetWindow(MainWindow);
-		glutPostRedisplay();
-	}
+	glutSetWindow( MainWindow );
+	glutPostRedisplay( );
+}
+
+
+void
+DoViewMenu( int id )
+{
+	SetView( id );
+
+	glutSetWindow( MainWindow );
+	glutPostRedisplay( );
+}
+
+// glut menus have no check marks, so put a '*' in front of the current choice:
+std::string MenuLabel( const char* text, bool current )
+{
+	return std::string( current ? "* " : "  " ) + text;
+}
+
+void
+RefreshOptionMenus( )
+{
+	int was = glutGetMenu( );
+
+	glutSetMenu( TimeMenu );
+	for( int i = 0; i < NUM_TIME_CONTROLS; i++ )
+		glutChangeToMenuEntry( i + 1, MenuLabel( TimeControls[i].name, i == TimeControlNow ).c_str( ), i );
+
+	glutSetMenu( HintsMenu );
+	glutChangeToMenuEntry( 1, MenuLabel( "On",  ShowHints ).c_str( ), 1 );
+	glutChangeToMenuEntry( 2, MenuLabel( "Off", !ShowHints ).c_str( ), 0 );
+
+	glutSetMenu( FlipMenu );
+	glutChangeToMenuEntry( 1, MenuLabel( "On",  AutoFlip ).c_str( ), 1 );
+	glutChangeToMenuEntry( 2, MenuLabel( "Off", !AutoFlip ).c_str( ), 0 );
+
+	glutSetMenu( PromoMenu );
+	glutChangeToMenuEntry( 1, MenuLabel( "Always Queen", !ChoosePromotion ).c_str( ), 0 );
+	glutChangeToMenuEntry( 2, MenuLabel( "Choose (1-4)",  ChoosePromotion ).c_str( ), 1 );
+
+	if( was != 0 )
+		glutSetMenu( was );
+}
+
+// picking a time control starts a new game with it:
+void
+DoTimeMenu( int id )
+{
+	TimeControlNow = id;
+	RefreshOptionMenus( );
+	DoMainMenu( NEW_GAME );
+}
+
+void
+DoHintsMenu( int id )
+{
+	ShowHints = ( id != 0 );
+	RefreshOptionMenus( );
+	glutSetWindow( MainWindow );
+	glutPostRedisplay( );
+}
+
+void
+DoFlipMenu( int id )
+{
+	AutoFlip = ( id != 0 );
+	ApplyAutoFlip( );
+	RefreshOptionMenus( );
+	glutSetWindow( MainWindow );
+	glutPostRedisplay( );
+}
+
+void
+DoPromoMenu( int id )
+{
+	ChoosePromotion = ( id != 0 );
+	RefreshOptionMenus( );
 }
 
 #pragma endregion
@@ -1902,257 +1658,10 @@ DoRasterString( float x, float y, float z, char *s )
 	char c;			// one character to print
 	for( ; ( c = *s ) != '\0'; s++ )
 	{
-		glutBitmapCharacter( GLUT_BITMAP_TIMES_ROMAN_24, c );
+		glutBitmapCharacter( GLUT_BITMAP_9_BY_15, c );
 	}
 }
 
-
-// use glut to display a string of characters using a stroke font:
-void
-DoStrokeString( float x, float y, float z, float ht, char *s )
-{
-	glPushMatrix( );
-		glTranslatef( (GLfloat)x, (GLfloat)y, (GLfloat)z );
-		float sf = ht / ( 119.05f + 33.33f );
-		glScalef( (GLfloat)sf, (GLfloat)sf, (GLfloat)sf );
-		char c;			// one character to print
-		for( ; ( c = *s ) != '\0'; s++ )
-		{
-			glutStrokeCharacter( GLUT_STROKE_ROMAN, c );
-		}
-	glPopMatrix( );
-}
-
-
-// return the number of seconds since the start of the program:
-float
-ElapsedSeconds( )
-{
-	// get # of milliseconds since the start of the program:
-
-	int ms = glutGet( GLUT_ELAPSED_TIME );
-
-	// convert it to seconds:
-
-	return (float)ms / 1000.f;
-}
-
-#pragma endregion
-
-#pragma region Draw
-// Function to draw a red circle in the X-Y plane
-void drawCircle() {
-	float theta;
-	glColor3f(1.0f, 0.0f, 0.0f);  // Set color to red
-	glBegin(GL_LINE_LOOP);  // Begin drawing line loop (circle)
-	for (int i = 0; i < 360; i++) {
-		theta = i * F_PI / 180;  // Convert degrees to radians
-		glVertex3f(2.0 * cos(theta), 2.0 * sin(theta), 0.0);
-	}
-	glEnd();  // End drawing
-}
-
-void drawGrid() {
-	GridList = glGenLists(1);
-	glNewList(GridList, GL_COMPILE);
-	SetMaterial(0.6f, 0.6f, 0.6f, 30.f);
-	glNormal3f(0., 1., 0.);
-	for (int i = 0; i < NZ; i++)
-	{
-		glBegin(GL_QUAD_STRIP);
-		for (int j = 0; j < NX; j++)
-		{
-			glVertex3f(X0 + DX * (float)j, YGRID, Z0 + DZ * (float)(i + 0));
-			glVertex3f(X0 + DX * (float)j, YGRID, Z0 + DZ * (float)(i + 1));
-		}
-		glEnd();
-	}
-	/*for (int i = 0; i < NY; i++)
-	{
-		glBegin(GL_QUAD_STRIP);
-		for (int j = 0; j < NX; j++)
-		{
-			glVertex3f(X0 + DX * (float)j, Y0 + DY * (float)(i + 0), ZGRID);
-			glVertex3f(X0 + DX * (float)j, Y0 + DY * (float)(i + 1), ZGRID);
-		}
-		glEnd();
-	}*/
-	glEndList();
-}
-
-void drawPieces()
-{
-	// for each piece in the list of piece types call the piece type and then for the rest of the objects 
-	// TODO when other piece objs are downladed change to KING
-	for (int type = PAWN; type <= KING; type++ )
-	{
-		// Initialize white pieces of this type
-		GLuint dl = 0;
-		GLuint bdl = 0;
-
-		glm::vec3 min = glm::vec3(1.e+37f);
-		glm::vec3 max = glm::vec3(-1.e+37f);
-		glm::vec3 origin = glm::vec3(0.);
-
-		for (Piece& whitePiece : chess.WhitePieces) {
-
-			if (whitePiece.type == type) {
-				if (dl == 0)
-				{
-					dl = whitePiece.DrawPiece(min, max, origin);
-				}
-
-				whitePiece.boundingBox = BoundingBox(min, max, origin);
-				if (DebugOn != 0 && bdl == 0)
-				{
-					bdl = whitePiece.DrawBoundingBox();
-				}
-
-				
-				whitePiece.displayList = dl;
-				whitePiece.bboxList = bdl;
-			}
-		}
-		dl = 0;
-		bdl = 0;
-		min = glm::vec3(1.e+37f);
-		max = glm::vec3(-1.e+37f);
-
-		// Initialize black pieces of this type
-		for (Piece& blackPiece : chess.BlackPieces) {
-
-			if (blackPiece.type == type) {
-				if (dl == 0)
-				{
-					dl = blackPiece.DrawPiece(min, max, origin);
-				}
-
-				blackPiece.boundingBox = BoundingBox(min, max, origin);
-				if (DebugOn != 0 && bdl == 0)
-				{
-					bdl = blackPiece.DrawBoundingBox();
-				}
-				
-				blackPiece.displayList = dl;
-				blackPiece.bboxList = bdl;
-			}
-		}
-	}
-	
-}
-
-void RenderRay()
-{
-	// Length of the ray for visualization
-	float rayLength = 10000.0f;  // You can adjust the length as needed
-
-	// Calculate the end point of the ray
-	glm::vec3 endPoint = rayOrigin + rayDir * rayLength;
-
-	// Save the current state of the OpenGL
-	glPushAttrib(GL_ENABLE_BIT);
-
-	// Disable lighting to make sure the color is what we set
-	glDisable(GL_LIGHTING);
-
-	// Set the color of the ray to be red for visibility
-	glColor3f(1.0f, 0.0f, 0.0f);
-
-	// Start drawing lines
-	glBegin(GL_LINES);
-
-	// Set the material properties if you're using lighting
-	// SetMaterial(...);
-
-	// Specify the two points of the line segment
-	glVertex3f(rayOrigin.x, rayOrigin.y, rayOrigin.z);
-	glVertex3f(endPoint.x, endPoint.y, endPoint.z);
-
-	// Done drawing lines
-	glEnd();
-
-	// Restore the state of OpenGL back to what it was before
-	glPopAttrib();
-}
-
-//void DrawPlanet(PlanetType planetType) {
-//	int planetIndex = static_cast<int>(planetType);
-//
-//	if (planetIndex >= VENUS && planetIndex <= NEPTUNE) {
-//		GLuint planet = glGenLists(1);
-//		glNewList(planet, GL_COMPILE);
-//		glBindTexture(GL_TEXTURE_2D, Planets[planetIndex].texObject);
-//		glPushMatrix();
-//		glScalef(Planets[planetIndex].scale, Planets[planetIndex].scale, Planets[planetIndex].scale);
-//		glCallList(SphereDL);
-//		glPopMatrix();
-//		glEndList();
-//
-//		Planets[planetIndex].displayList = planet;
-//	}
-//	else {
-//		fprintf(stderr, "Invalid planet type.\n");
-//	}
-//}
-
-#pragma endregion
-
-#pragma region Textures
-//void LoadPlanetTexture(PlanetType planet) {
-//	int width, height;
-//	if (planet >= VENUS && planet <= NEPTUNE) {
-//		const char* planetPath = Planets[planet].file;
-//		std::string path = "planets/" + std::string(planetPath);
-//		char* file = new char[path.length() + 1];
-//		std::strcpy(file, path.c_str());
-//
-//		unsigned char* texture = BmpToTexture(file, &width, &height);
-//		if (texture == NULL) {
-//			fprintf(stderr, "Cannot open texture '%s'\n", file);
-//		}
-//		else {
-//			fprintf(stderr, "Opened '%s': width = %d ; height = %d\n", file, width, height);
-//
-//			glGenTextures(1, &Planets[planet].texObject);
-//			glBindTexture(GL_TEXTURE_2D, Planets[planet].texObject);
-//			glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-//			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-//			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-//			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-//			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-//			glTexImage2D(GL_TEXTURE_2D, 0, 3, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, texture);
-//		}
-//
-//		delete[] file;
-//	}
-//	else {
-//		fprintf(stderr, "Invalid planet type.\n");
-//	}
-//}
-
-#pragma endregion
-
-#pragma region keytime Anmiation 
-void FallingTimes() {
-	fallingAnimation.Init();
-
-	// Scale key times based on total duration
-	fallingAnimation.AddTimeValue(0.0f, 0.0f); // Start
-	fallingAnimation.AddTimeValue(1.0f / 6.0f * fallingDuration, 10.0f); 
-	fallingAnimation.AddTimeValue(2.0f / 6.0f * fallingDuration, 45.0f); 
-	fallingAnimation.AddTimeValue(3.0f / 6.0f * fallingDuration, 89.0f); 
-	fallingAnimation.AddTimeValue(4.0f / 6.0f * fallingDuration, 76.0f); 
-	fallingAnimation.AddTimeValue(5.0f / 6.0f * fallingDuration, 89.0f); 
-	fallingAnimation.AddTimeValue(11.0f / 12.0f * fallingDuration, 85.0f);
-	fallingAnimation.AddTimeValue(6.0f / 6.0f * fallingDuration, 90.0f);
-}
-
-float GetFallingTime(float elapsedTime) {
-	if (elapsedTime < 0.f || elapsedTime > fallingDuration)
-		return fallingAnimation.GetLastTime();
-	else
-		return fallingAnimation.GetValue(elapsedTime);
-}
 #pragma endregion
 
 #pragma region initMethods
@@ -2161,9 +1670,6 @@ float GetFallingTime(float elapsedTime) {
 void
 InitMenus( )
 {
-	if (DebugOn != 0)
-		fprintf(stderr, "Starting InitMenus.\n");
-
 	glutSetWindow( MainWindow );
 
 	int numColors = sizeof( Colors ) / ( 3*sizeof(float) );
@@ -2181,14 +1687,6 @@ InitMenus( )
 	glutAddMenuEntry( "Off",  0 );
 	glutAddMenuEntry( "On",   1 );
 
-	int depthbuffermenu = glutCreateMenu( DoDepthBufferMenu );
-	glutAddMenuEntry( "Off",  0 );
-	glutAddMenuEntry( "On",   1 );
-
-	int depthfightingmenu = glutCreateMenu( DoDepthFightingMenu );
-	glutAddMenuEntry( "Off",  0 );
-	glutAddMenuEntry( "On",   1 );
-
 	int debugmenu = glutCreateMenu( DoDebugMenu );
 	glutAddMenuEntry( "Off",  0 );
 	glutAddMenuEntry( "On",   1 );
@@ -2197,33 +1695,52 @@ InitMenus( )
 	glutAddMenuEntry( "Orthographic",  ORTHO );
 	glutAddMenuEntry( "Perspective",   PERSP );
 
-	int viewmenu = glutCreateMenu(SetCameraView);
-	glutAddMenuEntry("Inside-Out", INSIDE_OUT);
-	glutAddMenuEntry("Angled", ANGLED);
-	glutAddMenuEntry("Head-On", HEAD_ON);
+	int viewmenu = glutCreateMenu( DoViewMenu );
+	glutAddMenuEntry( "White Side", VIEW_WHITE );
+	glutAddMenuEntry( "Black Side", VIEW_BLACK );
+	glutAddMenuEntry( "Top Down",   VIEW_TOP );
+
+	// game options -- entries get relabeled by RefreshOptionMenus( ):
+	TimeMenu = glutCreateMenu( DoTimeMenu );
+	for( int i = 0; i < NUM_TIME_CONTROLS; i++ )
+		glutAddMenuEntry( TimeControls[i].name, i );
+
+	HintsMenu = glutCreateMenu( DoHintsMenu );
+	glutAddMenuEntry( "On",  1 );
+	glutAddMenuEntry( "Off", 0 );
+
+	FlipMenu = glutCreateMenu( DoFlipMenu );
+	glutAddMenuEntry( "On",  1 );
+	glutAddMenuEntry( "Off", 0 );
+
+	PromoMenu = glutCreateMenu( DoPromoMenu );
+	glutAddMenuEntry( "Always Queen", 0 );
+	glutAddMenuEntry( "Choose (1-4)", 1 );
+
+	int optionsmenu = glutCreateMenu( DoMainMenu );
+	glutAddSubMenu( "Time Control",    TimeMenu );
+	glutAddSubMenu( "Move Hints",      HintsMenu );
+	glutAddSubMenu( "Auto-Flip Board", FlipMenu );
+	glutAddSubMenu( "Promotion",       PromoMenu );
 
 	int mainmenu = glutCreateMenu( DoMainMenu );
-	glutAddSubMenu(   "Axes",          axesmenu);
-	glutAddSubMenu(   "Axis Colors",   colormenu);
-	glutAddSubMenu(	"View", viewmenu);
-
-#ifdef DEMO_DEPTH_BUFFER
-	glutAddSubMenu(   "Depth Buffer",  depthbuffermenu);
-#endif
-
-#ifdef DEMO_Z_FIGHTING
-	glutAddSubMenu(   "Depth Fighting",depthfightingmenu);
-#endif
-
-	glutAddSubMenu(   "Depth Cue",     depthcuemenu);
+	glutAddMenuEntry( "New Game",      NEW_GAME );
+	glutAddMenuEntry( "Undo Move",     UNDO );
+	glutAddSubMenu(   "Game Options",  optionsmenu );
+	glutAddSubMenu(   "View",          viewmenu );
 	glutAddSubMenu(   "Projection",    projmenu );
-	glutAddMenuEntry( "Reset",         RESET );
-	glutAddSubMenu(   "Debug",         debugmenu);
+	glutAddSubMenu(   "Axes",          axesmenu );
+	glutAddSubMenu(   "Axis Colors",   colormenu );
+	glutAddSubMenu(   "Depth Cue",     depthcuemenu );
+	glutAddSubMenu(   "Debug",         debugmenu );
+	glutAddMenuEntry( "Reset View",    RESET );
 	glutAddMenuEntry( "Quit",          QUIT );
 
 // attach the pop-up menu to the right mouse button:
 
 	glutAttachMenu( GLUT_RIGHT_BUTTON );
+
+	RefreshOptionMenus( );
 }
 
 // initialize the glut and OpenGL libraries:
@@ -2231,9 +1748,6 @@ InitMenus( )
 void
 InitGraphics( )
 {
-	if (DebugOn != 0)
-		fprintf(stderr, "Starting InitGraphics.\n");
-
 	// request the display modes:
 	// ask for red-green-blue-alpha color, double-buffering, and z-buffering:
 
@@ -2250,58 +1764,20 @@ InitGraphics( )
 	// set the framebuffer clear values:
 	glClearColor( GRAY[0], GRAY[1], GRAY[2], GRAY[3] );
 
-	// setup the callback functions:
-	// DisplayFunc -- redraw the window
-	// ReshapeFunc -- handle the user resizing the window
-	// KeyboardFunc -- handle a keyboard input
-	// MouseFunc -- handle the mouse button going down or up
-	// MotionFunc -- handle the mouse moving with a button down
-	// PassiveMotionFunc -- handle the mouse moving with a button up
-	// VisibilityFunc -- handle a change in window visibility
-	// EntryFunc	-- handle the cursor entering or leaving the window
-	// SpecialFunc -- handle special keys on the keyboard
-	// SpaceballMotionFunc -- handle spaceball translation
-	// SpaceballRotateFunc -- handle spaceball rotation
-	// SpaceballButtonFunc -- handle spaceball button hits
-	// ButtonBoxFunc -- handle button box hits
-	// DialsFunc -- handle dial rotations
-	// TabletMotionFunc -- handle digitizing tablet motion
-	// TabletButtonFunc -- handle digitizing tablet button hits
-	// MenuStateFunc -- declare when a pop-up menu is in use
-	// TimerFunc -- trigger something to happen a certain time from now
-	// IdleFunc -- what to do when nothing else is going on
-
 	glutSetWindow( MainWindow );
 	glutDisplayFunc( Display );
 	glutReshapeFunc( Resize );
 	glutKeyboardFunc( Keyboard );
+	glutSpecialFunc( SpecialKeys );
 	glutMouseFunc( MouseButton );
 	glutMotionFunc( MouseMotion );
-	glutPassiveMotionFunc(MouseMotion);
-	//glutPassiveMotionFunc( NULL );
+	glutPassiveMotionFunc( MousePassive );
 	glutVisibilityFunc( Visibility );
-	glutEntryFunc( NULL );
-	glutSpecialFunc( NULL );
-	glutSpaceballMotionFunc( NULL );
-	glutSpaceballRotateFunc( NULL );
-	glutSpaceballButtonFunc( NULL );
-	glutButtonBoxFunc( NULL );
-	glutDialsFunc( NULL );
-	glutTabletMotionFunc( NULL );
-	glutTabletButtonFunc( NULL );
-	glutMenuStateFunc( NULL );
-	glutTimerFunc( -1, NULL, 0 );
+
+	// no idle function until something needs animating:
+	glutIdleFunc( NULL );
 
 	FallingTimes();
-	//for (int i = VENUS; i <= NEPTUNE; ++i) {
-	//	LoadPlanetTexture(static_cast<PlanetType>(i));
-	//}
-	// setup glut to call Animate( ) every time it has
-	// 	nothing it needs to respond to (which is most of the time)
-	// we don't need to do this for this program, and really should set the argument to NULL
-	// but, this sets us up nicely for doing animation
-
-	glutIdleFunc( Animate );
 
 	// init the glew package (a window must be open to do this):
 
@@ -2311,13 +1787,7 @@ InitGraphics( )
 	{
 		fprintf( stderr, "glewInit Error\n" );
 	}
-	else
-		fprintf( stderr, "GLEW initialized OK\n" );
-	fprintf( stderr, "Status: Using GLEW %s\n", glewGetString(GLEW_VERSION));
 #endif
-
-	// all other setups go here, such as GLSLProgram and KeyTime setups:
-
 }
 
 // initialize the display lists that will not change:
@@ -2327,49 +1797,137 @@ InitGraphics( )
 void
 InitLists( )
 {
-	if (DebugOn != 0)
-		fprintf(stderr, "Starting InitLists.\n");
-
 	glutSetWindow( MainWindow );
 
+	// one list per piece type -- the material is set per piece at draw time
+	for (int type = PAWN; type <= KING; type++)
+	{
+		std::string file = "pieces/" + PieceTypeToString(type) + ".obj";
+		glm::vec3 center;
+		PieceLists[type] = glGenLists(1);
+		glNewList(PieceLists[type], GL_COMPILE);
+		ObjTriangleSink = &PieceTris[type];
+		LoadObjFile(&file[0], PieceMin[type], PieceMax[type], center);
+		ObjTriangleSink = nullptr;
+		glEndList();
+	}
 
-	drawPieces();
-	chess.board.drawBoard();
+	// the checkerboard, sitting on a dark border that the coordinates are written on:
+	BoardList = glGenLists(1);
+	glNewList(BoardList, GL_COMPILE);
+	glBegin(GL_QUADS);
+	float edge = 4.f * TILE + BORDER;
+	glColor3f(0.22f, 0.16f, 0.1f);
+	glVertex3f(-edge, -0.1f, -edge);
+	glVertex3f(-edge, -0.1f,  edge);
+	glVertex3f( edge, -0.1f,  edge);
+	glVertex3f( edge, -0.1f, -edge);
+	for (int sq = 0; sq < 64; sq++)
+	{
+		bool light = (FileOf(sq) + RankOf(sq)) % 2 == 1;	// a1 is dark
+		float c = light ? 1.0f : 0.1f;
+		glColor3f(c, c, c);
+		glm::vec3 p = SquareCenter(sq);
+		float h = 0.5f * TILE;
+		glVertex3f(p.x - h, 0.f, p.z - h);
+		glVertex3f(p.x - h, 0.f, p.z + h);
+		glVertex3f(p.x + h, 0.f, p.z + h);
+		glVertex3f(p.x + h, 0.f, p.z - h);
+	}
+	glEnd();
+	glEndList();
 
 	// create the axes:
 	AxesList = glGenLists( 1 );
 	glNewList( AxesList, GL_COMPILE );
 		glLineWidth( AXES_WIDTH );
-			Axes( 20 );
+			Axes( 100 );
 		glLineWidth( 1. );
 	glEndList( );
 }
 #pragma endregion
 
+#pragma region Input
+
 // the keyboard callback:
 void
 Keyboard( unsigned char c, int x, int y )
 {
-	if( DebugOn != 0 )
-		fprintf( stderr, "Keyboard: '%c' (0x%0x)\n", c, c );
+	// while a promotion is pending, 1-4 (or q/r/b/n) pick the piece and Esc cancels:
+	if( PendingPromoTo >= 0 )
+	{
+		int type = NO_PIECE;
+		switch( tolower( c ) )
+		{
+			case '1': case 'q':	type = QUEEN;	break;
+			case '2': case 'r':	type = ROOK;	break;
+			case '3': case 'b':	type = BISHOP;	break;
+			case '4': case 'n':	type = KNIGHT;	break;
+		}
+		if( type != NO_PIECE )
+			ChoosePromotionPiece( type );
+		else if( c == ESCAPE )
+			PendingPromoFrom = PendingPromoTo = -1;
+		glutSetWindow( MainWindow );
+		glutPostRedisplay( );
+		return;
+	}
 
 	switch( c )
 	{
+		case 'p':
+		case 'P':
+			if( IsTimed( ) && !IsGameOver( ) )
+			{
+				UpdateClock( );			// charge time up to the pause
+				ClockPaused = !ClockPaused;
+				SelectedSq = -1;
+			}
+			break;
+
+		case 'n':
+		case 'N':
+			DoMainMenu( NEW_GAME );
+			break;
+
+		case 'u':
+		case 'U':
+			DoMainMenu( UNDO );
+			break;
+
+		case 'v':
+		case 'V':
+			// flip to the other side of the board:
+			SetView( (cos(glm::radians(CamYaw)) > 0.f) ? VIEW_BLACK : VIEW_WHITE );
+			break;
+
 		case 'f':
 		case 'F':
 			Frozen = !Frozen;
 			if (Frozen)
-				glutIdleFunc(NULL);
+				StopAnimating();
 			else
-				glutIdleFunc(Animate);
-		case 'l':
-		case 'L':
-			LightMode = !LightMode; // Toggle Light Mode on / off
+				StartAnimating();
 			break;
 
-		case 't':
-		case 'T':
-			TextureType = !TextureType; // Toggle texture on/off
+		case 'l':
+		case 'L':
+			isSpotLight = !isSpotLight;
+			break;
+
+		case 'd':
+		case 'D':
+			DoDebugMenu( DebugOn == 0 ? 1 : 0 );
+			break;
+
+		case '+':
+		case '=':
+			CamDist = std::max(CamDist / ZOOM_FACTOR, CAM_DIST_MIN);
+			break;
+
+		case '-':
+		case '_':
+			CamDist = std::min(CamDist * ZOOM_FACTOR, CAM_DIST_MAX);
 			break;
 
 		case 'q':
@@ -2379,28 +1937,27 @@ Keyboard( unsigned char c, int x, int y )
 			break;				// happy compiler
 
 		case 'w':
-			LightColorNow = 6; // White
+			LightColorNow = LIGHT_WHITE;
 			break;
 
 		case 'r':
-			LightColorNow = 0; // Red
+			LightColorNow = RED;
 			break;
 
 		case 'g':
-			LightColorNow = 2; // Green
+			LightColorNow = GREEN;
 			break;
 
 		case 'b':
-			LightColorNow = 4; // Blue
+			LightColorNow = BLUE;
 			break;
 
 		case 'y':
-			LightColorNow = 1; // Yellow
+			LightColorNow = YELLOW;
 			break;
 
-
 		default:
-			fprintf( stderr, "Don't know what to do with keyboard hit: '%c' (0x%0x)\n", c, c );
+			return;		// nothing changed, no need to redraw
 	}
 
 	// force a call to Display( ):
@@ -2409,207 +1966,90 @@ Keyboard( unsigned char c, int x, int y )
 	glutPostRedisplay( );
 }
 
-#pragma region Mouse
+// arrow keys orbit the camera:
+void
+SpecialKeys( int key, int x, int y )
+{
+	switch( key )
+	{
+		case GLUT_KEY_LEFT:		CamYaw -= ORBIT_KEY_STEP;	break;
+		case GLUT_KEY_RIGHT:	CamYaw += ORBIT_KEY_STEP;	break;
+		case GLUT_KEY_UP:		CamPitch = std::min(CamPitch + ORBIT_KEY_STEP, CAM_PITCH_MAX);	break;
+		case GLUT_KEY_DOWN:		CamPitch = std::max(CamPitch - ORBIT_KEY_STEP, CAM_PITCH_MIN);	break;
+		default:				return;
+	}
 
-glm::vec3 GetRayDirection(float mouseX, float mouseY, const glm::ivec2& screenSize) {
-	// Convert mouse coordinates to normalized device coordinates
-	glm::vec2 mouseNDC;
-	mouseNDC.x = (2.0f * mouseX) / screenSize.x - 1.0f;
-	mouseNDC.y = 1.0f - (2.0f * mouseY) / screenSize.y;
-
-	// Convert NDC to world space to get the ray direction
-	glm::vec4 clipCoords = glm::vec4(mouseNDC.x, mouseNDC.y, -1.0f, 1.0f);
-	glm::vec4 eyeCoords = glm::inverse(projMatrix) * clipCoords;
-	eyeCoords = glm::vec4(eyeCoords.x, eyeCoords.y, -1.0f, 0.0f);
-	glm::vec3 worldRayDir = glm::normalize(glm::vec3(glm::inverse(viewMatrix) * eyeCoords));
-
-	return worldRayDir;
-}
-
-/*unproject is code I might want*/
-//glm::vec3 Unproject(float x, float y,const glm::ivec2& screenSize, float planeDepth = 0.1f) {
-//	// Convert screen coordinates to normalized device coordinates
-//	glm::vec3 ndc;
-//	ndc.x = (2.0f * x) / screenSize.x - 1.0f;
-//	ndc.y = 1.0f - (2.0f * y) / screenSize.y;
-//	ndc.z = planeDepth; // Assuming we're unprojecting to the far plane for simplicity
-//
-//	// Convert NDC to clip space
-//	glm::vec4 clipSpace = glm::vec4(ndc, 1.f);
-//
-//	// Unproject from clip space to camera space
-//	glm::mat4 invProjMatrix = glm::inverse(projMatrix);
-//	glm::vec4 cameraSpace = invProjMatrix * clipSpace;
-//
-//	// Unproject from camera space to world space
-//	glm::mat4 invViewMatrix = glm::inverse(viewMatrix);
-//	glm::vec4 worldSpace = invViewMatrix * cameraSpace;
-//
-//	// Assuming the w component is not 0, we divide by w to get the correct coordinates
-//	if (worldSpace.w != 0.0f) {
-//		worldSpace /= worldSpace.w;
-//	}
-//
-//	return glm::vec3(worldSpace);
-//}
-
-void GetRayFromMouse(float mouseX, float mouseY) {
-	// Retrieve the viewport dimensions
-	GLint viewport[4];
-	glGetIntegerv(GL_VIEWPORT, viewport);
-	glm::ivec2 viewSize(viewport[2], viewport[3]);
-
-	// The ray's origin is the camera's position
-	//rayOrigin = Unproject(mouseX, mouseY, viewSize);
-	//rayFar = Unproject(mouseX, mouseY, viewSize, 10.f);
-	//test(mouseX, mouseY, viewSize);
-	rayOrigin = cameraPos;
-
-	// Get the ray's direction from the mouse position
-	rayDir = GetRayDirection(mouseX, mouseY, viewSize);
+	glutSetWindow( MainWindow );
+	glutPostRedisplay( );
 }
 
 // called when the mouse button transitions down or up:
 void
 MouseButton( int button, int state, int x, int y )
 {
-	int b = 0;			// LEFT, MIDDLE, or RIGHT
-
-	if( DebugOn != 0 )
-		fprintf( stderr, "MouseButton: %d, %d, %d, %d\n", button, state, x, y );
-
-	// get the proper button bit mask:
-	switch( button )
+	if( state == GLUT_DOWN )
 	{
-		case GLUT_LEFT_BUTTON:
-			if (DebugOn != 0)
-				fprintf(stderr, "We thinks its Left: %d\n", button);
-			b = LEFT;		break;
-
-		case GLUT_MIDDLE_BUTTON:
-			if (DebugOn != 0)
-				fprintf(stderr, "We thinks its Middle: %d\n", button);
-			b = MIDDLE;		break;
-
-		case GLUT_RIGHT_BUTTON:
-			if (DebugOn != 0)
-				fprintf(stderr, "We thinks its Right: %d\n", button);
-			b = RIGHT;		break;
-
-		case SCROLL_WHEEL_UP:
-			if (DebugOn != 0)
-				fprintf(stderr, "We thinks its wheel up: %d\n", button);
-		//	Scale += SCLFACT * zoomSpeed;
-		//	// keep object from turning inside-out or disappearing:
-		//	if (Scale < minFov)
-		//		fov = minFov;
-			break;
-
-		case SCROLL_WHEEL_DOWN:
-			if (DebugOn != 0)
-				fprintf(stderr, "We thinks its wheel down: %d\n", button);
-		//	fov -= SCLFACT * zoomSpeed;
-		//	// keep object from turning inside-out or disappearing:
-		//	if (fov < minFov)
-		//		fov = minFov;
-			break;
-
-		default:
-			b = 0;
-			fprintf( stderr, "Unknown mouse button: %d\n", button );
-	}
-
-	int modifiers = glutGetModifiers();
-	bool shiftPressed = (modifiers & GLUT_ACTIVE_SHIFT) != 0;
-
-	// button down sets the bit, up clears the bit:
-	if(state == GLUT_DOWN)
-	{
-		if (button == GLUT_LEFT_BUTTON && !shiftPressed)
+		switch( button )
 		{
-			GetRayFromMouse(x, y);
-			chess.HandleSelection(rayOrigin, rayDir);
+			case GLUT_LEFT_BUTTON:
+				if( glutGetModifiers( ) & GLUT_ACTIVE_SHIFT )
+					ActiveButton = 1;	// shift + drag orbits the camera
+				else
+					HandleClick( PickSquare( x, y ) );
+				break;
+
+			case SCROLL_WHEEL_UP:
+				CamDist = std::max(CamDist / ZOOM_FACTOR, CAM_DIST_MIN);
+				break;
+
+			case SCROLL_WHEEL_DOWN:
+				CamDist = std::min(CamDist * ZOOM_FACTOR, CAM_DIST_MAX);
+				break;
 		}
-		else
-		{
-			if (button == GLUT_LEFT_BUTTON && shiftPressed)
-			{
-				if (DebugOn != 0)
-					fprintf(stderr, "Shift be down and Left Click triggered!");
-				// Handle camera movement
-
-				ActiveButton |= b; // set the proper bit for camera movement
-			}
-			else if (button == SCROLL_WHEEL_UP)
-			{
-				Scale -= SCLFACT * zoomSpeed; // Decrease the FOV (zoom in)
-				if (Scale < minFov)
-					Scale = minFov;
-			}
-			else if (button == SCROLL_WHEEL_DOWN)
-			{
-				Scale += SCLFACT * zoomSpeed; // Increase the FOV (zoom out)
-				if (Scale > maxFov)
-					Scale = maxFov;
-			}
-
-			// Recalculate projection matrix with the new FOV:
-			GLsizei vx = glutGet(GLUT_WINDOW_WIDTH);
-			GLsizei vy = glutGet(GLUT_WINDOW_HEIGHT);
-			aspectRatio = (float)vx / (float)vy;
-
-			UpdateCamera();
-		}
-
-		Xmouse = x; // new current position
+		Xmouse = x;
 		Ymouse = y;
 	}
 	else
 	{
-		ActiveButton &= ~b; // clear the proper bit
+		ActiveButton = 0;
 	}
 
-	glutSetWindow(MainWindow);
-	glutPostRedisplay();
-
+	glutSetWindow( MainWindow );
+	glutPostRedisplay( );
 }
 
 // called when the mouse moves while a button is down:
 void
 MouseMotion( int x, int y )
 {
-	int dx = x - Xmouse;		// change in mouse coords
-	int dy = y - Ymouse;
-
-	// TODO have on hover to highlight the piece
-
-	if( ( ActiveButton & LEFT ) != 0 )
+	if( ActiveButton != 0 )
 	{
-		Xrot += ( ANGFACT*dy );
-		Yrot += ( ANGFACT*dx );
+		CamYaw += ORBIT_SPEED * ( x - Xmouse );
+		CamPitch = glm::clamp( CamPitch + ORBIT_SPEED * ( y - Ymouse ), CAM_PITCH_MIN, CAM_PITCH_MAX );
+		glutSetWindow( MainWindow );
+		glutPostRedisplay( );
 	}
 
-	if( ( ActiveButton & MIDDLE ) != 0 )
-	{
-		Scale += SCLFACT * (float) ( dx - dy );
-
-		// keep object from turning inside-out or disappearing:
-
-		if(Scale < minFov )
-			Scale = minFov;
-	}
-
-	Xmouse = x;			// new current position
+	Xmouse = x;
 	Ymouse = y;
-
-	UpdateCamera();
-
-	glutSetWindow( MainWindow );
-	glutPostRedisplay( );
 }
+
+// called when the mouse moves with no button down -- only redraw if the hovered square changes
+void
+MousePassive( int x, int y )
+{
+	int sq = PickSquare( x, y );
+	if( sq != HoverSq || DebugOn != 0 )
+	{
+		HoverSq = sq;
+		glutSetWindow( MainWindow );
+		glutPostRedisplay( );
+	}
+}
+
 #pragma endregion
 
-// reset the transformations and the colors:
+// reset the view and display options (not the game):
 // this only sets the global variables --
 // the glut main loop is responsible for redrawing the scene
 void
@@ -2617,23 +2057,15 @@ Reset( )
 {
 	ActiveButton = 0;
 	AxesOn = 0;
-	DebugOn = 1;
-	DepthBufferOn = 1;
-	DepthFightingOn = 0;
+	DebugOn = 0;
 	DepthCueOn = 0;
-	Scale = .05;
-	ShadowsOn = 0;
+	Frozen = false;
+	HaveRay = false;
 	NowColor = YELLOW;
 	NowProjection = PERSP;
-	Xrot = Yrot = 0.;
-	LightMode = false;
-	TextureType = true;
-	//cameraPos = glm::vec3(400, 400, 400); // Camera position
-	//cameraTarget = glm::vec3(0, 0, 0); // Look-at point
-	//upVector = glm::vec3(0, 1, 0);     // Up vector
-	//float fov = 1.f;                          // Field of view
-	rayDir = glm::vec3(69);
-	rayOrigin = glm::vec3(69);
+	LightColorNow = LIGHT_WHITE;
+	isSpotLight = false;
+	SetView( VIEW_WHITE );
 }
 
 // called when user resizes the window:
@@ -2651,19 +2083,10 @@ Resize( int width, int height )
 void
 Visibility ( int state )
 {
-	if( DebugOn != 0 )
-		fprintf( stderr, "Visibility: %d\n", state );
-
 	if( state == GLUT_VISIBLE )
 	{
 		glutSetWindow( MainWindow );
 		glutPostRedisplay( );
-	}
-	else
-	{
-		// could optimize by keeping track of the fact
-		// that the window is not visible and avoid
-		// animating or redrawing it ...
 	}
 }
 
@@ -2721,7 +2144,7 @@ Axes( float length )
 			int j = xorder[i];
 			if( j < 0 )
 			{
-				
+
 				glEnd( );
 				glBegin( GL_LINE_STRIP );
 				j = -j;
@@ -2737,7 +2160,7 @@ Axes( float length )
 			int j = yorder[i];
 			if( j < 0 )
 			{
-				
+
 				glEnd( );
 				glBegin( GL_LINE_STRIP );
 				j = -j;
@@ -2753,7 +2176,7 @@ Axes( float length )
 			int j = zorder[i];
 			if( j < 0 )
 			{
-				
+
 				glEnd( );
 				glBegin( GL_LINE_STRIP );
 				j = -j;
@@ -2765,97 +2188,7 @@ Axes( float length )
 
 }
 
-char* ToChar(const char* crap)
-{
-	// Get the length of the const char*
-	size_t length = std::strlen(crap);
-
-	// Create a char* buffer of the same length
-	char* charBuffer = new char[length + 1]; // +1 for the null terminator
-
-	// Copy the content from const char* to char*
-	std::strcpy(charBuffer, crap);
-
-	return charBuffer;
-}
-
 #pragma region CustomMathMethods
-	// function to convert HSV to RGB
-	// 0.  <=  s, v, r, g, b  <=  1.
-	// 0.  <= h  <=  360.
-	// when this returns, call:
-	//		glColor3fv( rgb );
-
-	void
-	HsvRgb( float hsv[3], float rgb[3] )
-	{
-		// guarantee valid input:
-
-		float h = hsv[0] / 60.f;
-		while( h >= 6. )	h -= 6.;
-		while( h <  0. ) 	h += 6.;
-
-		float s = hsv[1];
-		if( s < 0. )
-			s = 0.;
-		if( s > 1. )
-			s = 1.;
-
-		float v = hsv[2];
-		if( v < 0. )
-			v = 0.;
-		if( v > 1. )
-			v = 1.;
-
-		// if sat==0, then is a gray:
-
-		if( s == 0.0 )
-		{
-			rgb[0] = rgb[1] = rgb[2] = v;
-			return;
-		}
-
-		// get an rgb from the hue itself:
-	
-		float i = (float)floor( h );
-		float f = h - i;
-		float p = v * ( 1.f - s );
-		float q = v * ( 1.f - s*f );
-		float t = v * ( 1.f - ( s * (1.f-f) ) );
-
-		float r=0., g=0., b=0.;			// red, green, blue
-		switch( (int) i )
-		{
-			case 0:
-				r = v;	g = t;	b = p;
-				break;
-	
-			case 1:
-				r = q;	g = v;	b = p;
-				break;
-	
-			case 2:
-				r = p;	g = v;	b = t;
-				break;
-	
-			case 3:
-				r = p;	g = q;	b = v;
-				break;
-	
-			case 4:
-				r = t;	g = p;	b = v;
-				break;
-	
-			case 5:
-				r = v;	g = p;	b = q;
-				break;
-		}
-
-
-		rgb[0] = r;
-		rgb[1] = g;
-		rgb[2] = b;
-	}
 
 	void
 	Cross(float v1[3], float v2[3], float vout[3])
@@ -2867,12 +2200,6 @@ char* ToChar(const char* crap)
 		vout[0] = tmp[0];
 		vout[1] = tmp[1];
 		vout[2] = tmp[2];
-	}
-
-	float
-	Dot(float v1[3], float v2[3])
-	{
-		return v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2];
 	}
 
 
@@ -2896,24 +2223,4 @@ char* ToChar(const char* crap)
 		return dist;
 	}
 
-
-	float
-	Unit( float v[3] )
-	{
-		float dist = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-		if (dist > 0.0)
-		{
-			dist = sqrtf(dist);
-			v[0] /= dist;
-			v[1] /= dist;
-			v[2] /= dist;
-		}
-		return dist;
-	}
-
-	bool AreVec3Equal(const glm::vec3& vec1, const glm::vec3& vec2, float tolerance) {
-		return (std::abs(vec1.x - vec2.x) < tolerance) &&
-			(std::abs(vec1.y - vec2.y) < tolerance) &&
-			(std::abs(vec1.z - vec2.z) < tolerance);
-	}
 #pragma endregion

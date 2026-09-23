@@ -40,6 +40,9 @@ struct face
 char *	ReadRestOfLine( FILE * );
 void	ReadObjVTN( char *, int *, int *, int * );
 
+// if set, every triangle vertex drawn is also appended here (3 per triangle) -- used for picking
+std::vector<glm::vec3> *ObjTriangleSink = nullptr;
+
 
 
 int
@@ -305,6 +308,8 @@ LoadObjFile( char *name, glm::vec3& min, glm::vec3& max, glm::vec3& origin)
 
 					struct Vertex *vp = &Vertices[ vertices[ vv[vtx] ].v - 1 ];
 					glVertex3f( vp->x, vp->y, vp->z );
+					if( ObjTriangleSink != nullptr )
+						ObjTriangleSink->push_back( glm::vec3( vp->x, vp->y, vp->z ) );
 				}
 			}
 			continue;

@@ -1,0 +1,30 @@
+name: Release
+
+# Publishing: push a version tag and this builds, tests, zips, and creates the GitHub Release.
+#   git tag v2.0.0
+#   git push origin v2.0.0
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write   # needed to create the release
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build, test, and package
+        shell: pwsh
+        run: .\scripts\package.ps1 -Version ("${{ github.ref_name }}".TrimStart('v'))
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          gh release create "${{ github.ref_name }}" "dist/ChessWithMeMate-$version-win32.zip" `
+            --title "Chess With Me Mate ${{ github.ref_name }}" --generate-notes

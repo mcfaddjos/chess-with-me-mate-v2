@@ -20,7 +20,7 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="ChessPiece.h">
+    <ClInclude Include="chessrules.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

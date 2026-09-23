@@ -80,8 +80,8 @@ function Invoke-Case([string]$Name, [string]$GameArgs, [string]$Squares, [string
             Start-Sleep -Milliseconds 700      # let the move animation finish
         }
         if ($Keys) { [System.Windows.Forms.SendKeys]::SendWait($Keys); Start-Sleep -Milliseconds 700 }
-        if ($p.HasExited) { throw "game exited (code $($p.ExitCode))" }
         Start-Sleep -Milliseconds 1200     # let capture animations finish before the screenshot
+        if ($p.HasExited) { $p.WaitForExit(); throw "game exited early (exit code $($p.ExitCode))" }
         Save-WindowShot $h (Join-Path $OutDir "$Name.png")
     }
     finally {
@@ -123,7 +123,10 @@ $summary = @("UI test run $(Get-Date -Format s)  exe: $Exe")
 Write-Host "== UI tests ($Exe)"
 foreach ($c in $cases) {
     try {
-        Invoke-Case -Name $c.Name -GameArgs $c.GameArgs -Squares $c.Squares -Keys $c.Keys -Expect $c.Expect -Forbid $(if ($c.Forbid) { $c.Forbid } else { @() })
+        # index with ['...']: on a hashtable, $c.Keys is the hashtable's own key list, not our field,
+        # and would get typed into the game (the 'q' in "Squares" quit it)
+        $forbid = if ($c.ContainsKey('Forbid')) { $c['Forbid'] } else { @() }
+        Invoke-Case -Name $c['Name'] -GameArgs $c['GameArgs'] -Squares $c['Squares'] -Keys $c['Keys'] -Expect $c['Expect'] -Forbid $forbid
         $line = "ok   {0}" -f $c.Name
     }
     catch {

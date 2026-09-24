@@ -30,6 +30,7 @@
 
 #include "chessrules.h"
 #include "engine.h"
+#include "replays.h"
 #include <thread>
 #include <atomic>
 #include <fstream>
@@ -71,7 +72,12 @@ void	Visibility(int);
 void	SyncPiecesToBoard();
 void	RefreshGameState();
 void	LoadProfile();
-void	StartNewGame(const char*);
+void	StartNewGame(const char*, bool challenge = false);
+void	StartAnalysis();
+void	StopAnalysis();
+void	ExitReview();
+void	StartReplay(int);
+void	ExitReplay();
 void	StartBot();
 void	StopBot();
 void	RecordResultIfOver();
@@ -215,7 +221,8 @@ enum ButtonVals
 	QUIT,
 	NEW_GAME,
 	UNDO,
-	RESIGN
+	RESIGN,
+	CHALLENGE
 };
 
 // who you play against, and which color you get:
@@ -348,7 +355,7 @@ const TimeControl TimeControls[] =
 };
 const int NUM_TIME_CONTROLS = sizeof(TimeControls) / sizeof(TimeControls[0]);
 int		TimeControlNow = 0;
-bool	ShowHints = true;
+bool	ShowHints = false;		// legal-move markers: off by default, find the moves yourself (H toggles)
 bool	AutoFlip = false;
 bool	ChoosePromotion = false;
 int		Opponent = OPPONENT_COMPUTER;
@@ -390,6 +397,39 @@ Move	BotResult;
 bool	BotThinking;
 int		BotGeneration;			// bumped whenever a search is abandoned, so stale results are ignored
 int		BotStartMs;
+bool	ChallengeGame;			// this bot is rated CHALLENGE_STRETCH above you instead of BOT_STRETCH
+
+// the game record, for the post-game review:
+std::string GameStartFen;		// empty = the normal starting position
+std::vector<Move> GameMoves;
+
+// post-game analysis, on its own worker thread:
+std::thread AnalysisThread;
+std::atomic<bool> AnalysisStop(false);
+std::atomic<bool> AnalysisDone(false);
+std::atomic<int> AnalysisProgress(0);
+int		AnalysisTotal;			// your moves to review
+bool	Analyzing;
+int		AnalysisGeneration;
+GameReport AnalysisResult;		// written by the worker
+GameReport Report;				// the finished report the HUD shows
+
+// stepping through your mistakes (A key): the board shows the position before each one
+int		ReviewLesson = -1;		// index into Report.lessons, or -1 when not reviewing
+ChessRules ReviewSaved;			// the real game, put back when the review closes
+bool	ReviewReveal;			// the better move stays hidden until you press H -- try to find it first
+
+// watching a stored game (right-click > Watch a Game); your own game is set aside meanwhile
+int		ReplayIndex = -1;		// index into Replays(), or -1 when not watching
+int		ReplayPos;				// moves shown so far
+bool	ReplayAuto;				// Space: play through on its own
+int		ReplayGeneration;		// stops a stale auto-play timer
+std::vector<Move> ReplayMoves;
+std::vector<char> ReplayMarks;	// '!' good move (green arrow), '?' mistake (red arrow), 0 plain
+ChessRules ReplaySaved;			// your game, put back when you stop watching
+bool	ReplaySavedPause;
+int		ReplayMenu;
+int		StartReplayIndex = -1;	// -replay N (testing)
 
 // last pick ray, drawn in debug mode:
 glm::vec3 RayOrigin, RayDir;
@@ -472,7 +512,8 @@ main( int argc, char *argv[ ] )
 	//   -seed N          repeatable bot moves
 	//   -profile PATH    where your rating is kept (default %APPDATA%\ChessWithMeMate\profile.txt)
 	//   -cam YAW,PITCH   start the camera here (degrees)
-	//   -choosepromo -autoflip -nohints   the matching Game Options
+	//   -choosepromo -autoflip -hints -nohints   the matching Game Options (hints are off by default)
+	//   -replay N        start by watching stored game N (see replays.h)
 	const char* startFen = nullptr;
 	const char* startCam = nullptr;
 	for( int i = 1; i < argc; i++ )
@@ -493,6 +534,8 @@ main( int argc, char *argv[ ] )
 		else if( a == "-choosepromo" )		ChoosePromotion = true;
 		else if( a == "-autoflip" )			AutoFlip = true;
 		else if( a == "-nohints" )			ShowHints = false;
+		else if( a == "-hints" )			ShowHints = true;
+		else if( a == "-replay" && more )	StartReplayIndex = atoi( argv[++i] );
 		else
 			fprintf( stderr, "Unknown option '%s'\n", argv[i] );
 	}
@@ -516,9 +559,12 @@ main( int argc, char *argv[ ] )
 		CamPitch = glm::clamp( pitch, CAM_PITCH_MIN, CAM_PITCH_MAX );
 	}
 
+	if( StartReplayIndex >= 0 )
+		StartReplay( StartReplayIndex );
+
 	// make sure a search thread is stopped before the program exits (closing the window
 	// exits from inside glut, and a still-running std::thread would abort the process):
-	atexit( []( ) { StopBot( ); } );
+	atexit( []( ) { StopBot( ); StopAnalysis( ); } );
 
 	// setup all the user interface stuff:
 
@@ -637,7 +683,7 @@ void RefreshGameState()
 	Status = Rules.Status();
 	const Move* last = Rules.LastMove();
 	LastMoveText = last ? MoveText(*last) : "";
-	if (IsGameOver())
+	if (IsGameOver() && ReplayIndex < 0)	// a replay's checkmate must not stop your saved game's clock
 		ClockRunning = false;
 }
 
@@ -932,18 +978,13 @@ Animate( )
 
 #pragma region Moves And Selection
 
-void PlayMove(const Move& m)
+// moves the pieces on screen (animated) and makes the move on Rules -- nothing else:
+// no clock, bot, rating, or game record (PlayMove adds those; replays use this directly).
+// Takes the move by value on purpose: callers often pass an element of LegalMoves, which
+// RefreshGameState() rebuilds partway through -- a reference would then name some other move.
+void AnimateMove(const Move m)
 {
 	FinishAnimations();
-
-	// settle the clock while it is still the mover's turn -- they may have just run out:
-	if (IsTimed())
-	{
-		UpdateClock();
-		if (FlagSide >= 0)
-			return;		// UpdateClock already recorded the result
-	}
-	int moverSide = Rules.side;
 
 	Piece* mover = PieceAt[m.from];
 	Piece* victim = nullptr;
@@ -977,11 +1018,28 @@ void PlayMove(const Move& m)
 	Rules.MakeMove(m);
 	SelectedSq = -1;
 	PendingPromoFrom = PendingPromoTo = -1;
+	RefreshGameState();
+	StartAnimating();
+}
+
+void PlayMove(const Move m)		// by value -- see AnimateMove
+{
+	FinishAnimations();
+
+	// settle the clock while it is still the mover's turn -- they may have just run out:
+	if (IsTimed())
+	{
+		UpdateClock();
+		if (FlagSide >= 0)
+			return;		// UpdateClock already recorded the result
+	}
+	int moverSide = Rules.side;
+
+	AnimateMove(m);
+	GameMoves.push_back(m);
 	if (!VsComputer() || moverSide == HumanSide)
 		RatingNote.clear();		// last game's rating change has been seen
-	RefreshGameState();
 	PressClock(moverSide);
-	StartAnimating();
 
 	if (DebugOn != 0)
 		fprintf(stderr, "%s%s\n", (VsComputer() && moverSide != HumanSide) ? "bot: " : "", LastMoveText.c_str());
@@ -995,7 +1053,7 @@ void HandleClick(int sq)
 	if (DebugOn != 0)
 		fprintf(stderr, "click %s\n", sq >= 0 ? SquareName(sq).c_str() : "off board");
 
-	if (IsGameOver() || ClockPaused)
+	if (IsGameOver() || ClockPaused || ReviewLesson >= 0 || ReplayIndex >= 0)
 		return;
 	if (VsComputer() && Rules.side != HumanSide)
 		return;		// the computer is thinking
@@ -1123,6 +1181,262 @@ void RecordResultIfOver()
 	RatingNote = buf;
 	if (DebugOn != 0)
 		fprintf(stderr, "result: %s, %s\n", score == 1.0 ? "win" : score == 0.0 ? "loss" : "draw", buf);
+
+	StartAnalysis();	// accuracy + the mistakes to learn from
+}
+
+// ---- post-game analysis ----
+
+void StopAnalysis()
+{
+	if (AnalysisThread.joinable())
+	{
+		AnalysisStop = true;
+		AnalysisThread.join();
+	}
+	AnalysisStop = false;
+	AnalysisDone = false;
+	Analyzing = false;
+	AnalysisGeneration++;
+}
+
+void AnalysisPoll(int generation)
+{
+	if (generation != AnalysisGeneration || !Analyzing)
+		return;
+	glutSetWindow(MainWindow);
+	glutPostRedisplay();		// progress counter
+	if (!AnalysisDone)
+	{
+		glutTimerFunc(250, AnalysisPoll, generation);
+		return;
+	}
+	AnalysisThread.join();
+	Analyzing = false;
+	Report = AnalysisResult;
+	if (DebugOn != 0 && Report.valid)
+	{
+		fprintf(stderr, "analysis: accuracy %.0f%%, %d blunders, %d mistakes, %d inaccuracies, %d lessons\n",
+			Report.accuracy, Report.counts[VERDICT_BLUNDER], Report.counts[VERDICT_MISTAKE],
+			Report.counts[VERDICT_INACCURACY], (int)Report.lessons.size());
+		for (const MoveReview& r : Report.moves)
+			fprintf(stderr, "  analysed move %d %s: depth %d, best %s %+d, played %+d, win %.0f%% -> %.0f%%, %s\n",
+				r.moveNumber, r.playedName.c_str(), r.depth, r.bestName.c_str(), r.bestScore, r.playedScore,
+				r.winBefore, r.winAfter, VerdictName(r.verdict));
+	}
+}
+
+// the starting position of the current game (normal setup or the -fen one)
+ChessRules GameStartPosition()
+{
+	ChessRules start;
+	if (!GameStartFen.empty())
+		start.LoadFEN(GameStartFen);
+	return start;
+}
+
+void StartAnalysis()
+{
+	StopAnalysis();
+	Report = GameReport();
+	ChessRules start = GameStartPosition();
+	std::vector<Move> moves = GameMoves;
+	int side = HumanSide;
+	if (DebugOn != 0)
+		fprintf(stderr, "analysis started: %d moves from %s\n", (int)moves.size(),
+			GameStartFen.empty() ? "the normal start" : GameStartFen.c_str());
+
+	AnalysisTotal = 0;
+	for (size_t i = 0; i < moves.size(); i++)
+		if ((start.side + (int)i) % 2 == side)
+			AnalysisTotal++;
+	if (AnalysisTotal == 0)
+		return;		// you never moved -- nothing to review
+
+	AnalysisProgress = 0;
+	AnalysisDone = false;
+	Analyzing = true;
+	AnalysisThread = std::thread([start, moves, side]()
+	{
+		AnalysisResult = AnalyzeGame(start, moves, side, AnalysisStop, AnalysisProgress);
+		AnalysisDone = true;
+	});
+	glutTimerFunc(250, AnalysisPoll, AnalysisGeneration);
+}
+
+// ---- reviewing your mistakes ----
+
+void ShowLesson(int lesson)
+{
+	if (!Report.valid || Report.lessons.empty())
+		return;
+	lesson = (lesson + (int)Report.lessons.size()) % (int)Report.lessons.size();	// wrap around
+	if (ReviewLesson < 0)
+		ReviewSaved = Rules;
+	ReviewLesson = lesson;
+	ReviewReveal = false;
+
+	const MoveReview& r = Report.moves[Report.lessons[lesson]];
+	ChessRules pos = GameStartPosition();
+	for (int i = 0; i < r.ply; i++)
+		pos.MakeMove(GameMoves[i]);
+	FinishAnimations();
+	Rules = pos;
+	SyncPiecesToBoard();
+	SelectedSq = -1;
+	PendingPromoFrom = PendingPromoTo = -1;
+
+	if (DebugOn != 0)		// the log has the answer for testing; the screen keeps it hidden until H
+		fprintf(stderr, "review %d/%d: move %d, played %s (%s), better %s, %s\n", lesson + 1, (int)Report.lessons.size(),
+			r.moveNumber, r.playedName.c_str(), VerdictName(r.verdict), r.bestName.c_str(), LessonCause(r).c_str());
+}
+
+// ---- watching a stored game ----
+
+void StartReplay(int index)
+{
+	const std::vector<ReplayGame>& games = Replays();
+	if (index < 0 || index >= (int)games.size())
+		return;
+	const ReplayGame& g = games[index];
+
+	// read the whole line first, so a bad game never half-loads
+	ChessRules pos;
+	if (g.fen != nullptr)
+		pos.LoadFEN(g.fen);
+	ChessRules start = pos;
+	std::vector<Move> moves;
+	std::vector<char> marks;
+	for (const ReplayPly& p : g.plies)
+	{
+		Move m;
+		char mark;
+		if (!ParseReplayMove(pos, p.move, m, mark))
+		{
+			fprintf(stderr, "Replay '%s': can't play '%s'\n", g.title, p.move);
+			return;
+		}
+		pos.MakeMove(m);
+		moves.push_back(m);
+		marks.push_back(mark);
+	}
+
+	ExitReview();
+	if (ReplayIndex >= 0)
+		ExitReplay();
+	StopBot();
+	FinishAnimations();
+
+	// set your game aside, with its clock paused
+	if (IsTimed())
+		UpdateClock();
+	ReplaySaved = Rules;
+	ReplaySavedPause = ClockPaused;
+	ClockPaused = true;
+
+	ReplayIndex = index;
+	ReplayPos = 0;
+	ReplayAuto = false;
+	ReplayGeneration++;
+	ReplayMoves = moves;
+	ReplayMarks = marks;
+	Rules = start;
+	SyncPiecesToBoard();
+	RefreshGameState();
+	SetView(VIEW_WHITE);
+	if (DebugOn != 0)
+		fprintf(stderr, "replay: %s\n", g.title);
+}
+
+void ReplayStep(int direction)
+{
+	if (ReplayIndex < 0)
+		return;
+	if (direction > 0 && ReplayPos < (int)ReplayMoves.size())
+	{
+		AnimateMove(ReplayMoves[ReplayPos]);
+		ReplayPos++;
+		if (DebugOn != 0)
+			fprintf(stderr, "replay move %d: %s\n", ReplayPos, LastMoveText.c_str());
+	}
+	else if (direction < 0 && ReplayPos > 0)
+	{
+		FinishAnimations();
+		Rules.UnmakeMove();
+		ReplayPos--;
+		SyncPiecesToBoard();
+		RefreshGameState();
+		if (DebugOn != 0)
+			fprintf(stderr, "replay back to move %d\n", ReplayPos);
+	}
+}
+
+void ReplayAutoTick(int generation)
+{
+	if (generation != ReplayGeneration || ReplayIndex < 0 || !ReplayAuto)
+		return;
+	if (ReplayPos >= (int)ReplayMoves.size())
+	{
+		ReplayAuto = false;
+		glutSetWindow(MainWindow);
+		glutPostRedisplay();
+		return;
+	}
+	ReplayStep(1);
+	glutSetWindow(MainWindow);
+	glutPostRedisplay();
+	glutTimerFunc(2200, ReplayAutoTick, generation);	// time to read each comment
+}
+
+void ToggleReplayAuto()
+{
+	ReplayAuto = !ReplayAuto;
+	ReplayGeneration++;
+	if (ReplayAuto)
+	{
+		if (ReplayPos >= (int)ReplayMoves.size())	// at the end: start over
+		{
+			while (ReplayPos > 0)
+			{
+				Rules.UnmakeMove();
+				ReplayPos--;
+			}
+			SyncPiecesToBoard();
+			RefreshGameState();
+		}
+		glutTimerFunc(400, ReplayAutoTick, ReplayGeneration);
+	}
+}
+
+void ExitReplay()
+{
+	if (ReplayIndex < 0)
+		return;
+	ReplayIndex = -1;
+	ReplayAuto = false;
+	ReplayGeneration++;
+	FinishAnimations();
+	Rules = ReplaySaved;
+	SyncPiecesToBoard();
+	RefreshGameState();
+	ClockPaused = ReplaySavedPause;
+	ClockLastMs = glutGet(GLUT_ELAPSED_TIME);	// the time spent watching isn't charged to anyone
+	SetView((VsComputer() && HumanSide == SIDE_BLACK) ? VIEW_BLACK : VIEW_WHITE);
+	if (DebugOn != 0)
+		fprintf(stderr, "replay closed\n");
+	StartBot();		// in case it was the computer's turn when you started watching
+}
+
+void ExitReview()
+{
+	if (ReviewLesson < 0)
+		return;
+	ReviewLesson = -1;
+	Rules = ReviewSaved;
+	SyncPiecesToBoard();
+	RefreshGameState();
+	if (DebugOn != 0)
+		fprintf(stderr, "review closed\n");
 }
 
 void StopBot()
@@ -1202,16 +1516,28 @@ void LeaveCurrentGame()
 	}
 }
 
-void StartNewGame(const char* fen)
+void StartNewGame(const char* fen, bool challenge)
 {
+	ExitReplay();
+	ExitReview();
 	LeaveCurrentGame();
+	StopAnalysis();
+	Report = GameReport();
 	FinishAnimations();
 	Rules.Reset();
-	if (fen != nullptr && !Rules.LoadFEN(fen))
+	GameStartFen.clear();
+	if (fen != nullptr)
 	{
-		fprintf(stderr, "Bad -fen position, using the normal setup\n");
-		Rules.Reset();
+		if (Rules.LoadFEN(fen))
+			GameStartFen = fen;
+		else
+		{
+			fprintf(stderr, "Bad -fen position, using the normal setup\n");
+			Rules.Reset();
+		}
 	}
+	GameMoves.clear();
+	ChallengeGame = challenge && VsComputer();
 	SyncPiecesToBoard();
 	SelectedSq = -1;
 	PendingPromoFrom = PendingPromoTo = -1;
@@ -1224,10 +1550,11 @@ void StartNewGame(const char* fen)
 		if (ColorChoice == COLOR_WHITE)			HumanSide = SIDE_WHITE;
 		else if (ColorChoice == COLOR_BLACK)	HumanSide = SIDE_BLACK;
 		else HumanSide = (Player.games % 2 == 0) ? SIDE_WHITE : SIDE_BLACK;	// alternate
-		BotElo = (FixedBotElo != 0) ? FixedBotElo : BotRatingFor(Player.rating);
+		BotElo = (FixedBotElo != 0) ? FixedBotElo : BotRatingFor(Player.rating, ChallengeGame);
 		SetView(HumanSide == SIDE_WHITE ? VIEW_WHITE : VIEW_BLACK);
 		if (DebugOn != 0)
-			fprintf(stderr, "--- new game vs bot %d, you play %s ---\n", BotElo, HumanSide == SIDE_WHITE ? "white" : "black");
+			fprintf(stderr, "--- new game vs bot %d%s, you play %s ---\n", BotElo, ChallengeGame ? " (challenge)" : "",
+				HumanSide == SIDE_WHITE ? "white" : "black");
 	}
 	else if (DebugOn != 0)
 		fprintf(stderr, "--- new game ---\n");
@@ -1265,6 +1592,11 @@ void UpdateMatrices()
 	}
 	else
 		ProjMatrix = glm::perspective(glm::radians(CAM_FOV), 1.f, 1.f, 3000.f);
+
+	// reviewing or watching: nudge the whole picture up so the text panel along the bottom
+	// doesn't cover rank 1 (picking uses these same matrices, so it stays exact)
+	if (ReviewLesson >= 0 || ReplayIndex >= 0)
+		ProjMatrix = glm::translate(glm::mat4(1.f), glm::vec3(0.f, 0.13f, 0.f)) * ProjMatrix;
 }
 
 void SetView(int view)
@@ -1297,9 +1629,9 @@ bool RayHitsBox(const glm::vec3& o, const glm::vec3& d, const glm::vec3& bmin, c
 // the empty corners of its bounding box (pieces taper, boxes don't)
 bool RayHitsModel(const glm::vec3& o, const glm::vec3& d, const Piece& p, const glm::vec3& base, float& tHit)
 {
-	// into the model's own coordinates -- black pieces are drawn turned 180 degrees about y:
+	// into the model's own coordinates -- white pieces are drawn turned 180 degrees about y (see DrawPiece):
 	glm::vec3 lo = o - base, ld = d;
-	if (!p.isWhite)
+	if (p.isWhite)
 	{
 		lo = glm::vec3(-lo.x, lo.y, -lo.z);
 		ld = glm::vec3(-ld.x, ld.y, -ld.z);
@@ -1400,9 +1732,13 @@ int PickSquare(int x, int y)
 
 void SetPieceMaterial(bool white, float alpha)
 {
-	// with lighting on, glColor is ignored -- alpha has to go through the material:
-	float c = white ? 1.f : 0.f;
-	GLfloat color[4] = { c, c, c, alpha };
+	// with lighting on, glColor is ignored -- alpha has to go through the material.
+	// Ivory and charcoal rather than pure white/black, so facets still read on both square colors:
+	GLfloat color[4] = { 0.95f, 0.92f, 0.84f, alpha };
+	if (!white)
+	{
+		color[0] = 0.17f; color[1] = 0.16f; color[2] = 0.16f;
+	}
 	GLfloat spec[4] = { .8f, .8f, .8f, alpha };
 	GLfloat none[4] = { 0.f, 0.f, 0.f, alpha };
 	glMaterialfv(GL_FRONT_AND_BACK, GL_EMISSION, none);
@@ -1423,8 +1759,8 @@ void DrawPiece(const Piece& p)
 		float angle = FallingAnimation.GetValue(std::min(AnimTime - p.deathStart, FALL_TIME));
 		glRotatef(angle, p.fallAxis.x, p.fallAxis.y, p.fallAxis.z);
 	}
-	if (!p.isWhite)
-		glRotatef(180.f, 0.f, 1.f, 0.f);	// knights face each other
+	if (p.isWhite)
+		glRotatef(180.f, 0.f, 1.f, 0.f);	// the knight model faces +z; turn white's so both sides face the enemy
 	SetPieceMaterial(p.isWhite, p.opacity);
 	glCallList(PieceLists[p.type]);
 	glPopMatrix();
@@ -1480,6 +1816,22 @@ void DrawHighlights()
 {
 	glDisable(GL_LIGHTING);
 
+	if (ReviewLesson >= 0)
+	{
+		// reviewing a mistake: outline the move you played (red) and the better one (green)
+		const MoveReview& r = Report.moves[Report.lessons[ReviewLesson]];
+		glColor4f(0.95f, 0.25f, 0.2f, 0.95f);
+		SquareFrame(r.played.from, 0.1f);
+		SquareFrame(r.played.to, 0.1f);
+		if (ReviewReveal)
+		{
+			glColor4f(0.25f, 0.9f, 0.35f, 0.95f);
+			SquareFrame(r.best.from, 0.1f);
+			SquareFrame(r.best.to, 0.1f);
+		}
+		return;
+	}
+
 	const Move* last = Rules.LastMove();
 	if (last != nullptr)
 	{
@@ -1530,6 +1882,60 @@ void DrawHighlights()
 		glColor4f(0.3f, 0.8f, 1.f, 0.9f);
 		SquareFrame(HoverSq, 0.06f);
 	}
+}
+
+// a flat arrow floating above the board, from the center of one square to another
+void DrawArrow(int fromSq, int toSq, float r, float g, float b)
+{
+	glm::vec3 a = SquareCenter(fromSq), z = SquareCenter(toSq);
+	a.y = z.y = 1.f;
+	glm::vec3 dir = z - a;
+	float len = glm::length(dir);
+	if (len < 0.001f)
+		return;
+	dir /= len;
+	glm::vec3 side = glm::vec3(-dir.z, 0.f, dir.x);		// perpendicular, in the board plane
+	float half = 0.09f * TILE, headLen = 0.35f * TILE, headHalf = 0.24f * TILE;
+	glm::vec3 neck = z - dir * headLen;
+
+	glColor4f(r, g, b, 0.8f);
+	glBegin(GL_QUADS);		// shaft
+	glVertex3fv(glm::value_ptr(a + side * half));
+	glVertex3fv(glm::value_ptr(neck + side * half));
+	glVertex3fv(glm::value_ptr(neck - side * half));
+	glVertex3fv(glm::value_ptr(a - side * half));
+	glEnd();
+	glBegin(GL_TRIANGLES);	// head
+	glVertex3fv(glm::value_ptr(neck + side * headHalf));
+	glVertex3fv(glm::value_ptr(z));
+	glVertex3fv(glm::value_ptr(neck - side * headHalf));
+	glEnd();
+}
+
+// review arrows go on top of everything, so a piece never hides them
+void DrawReviewArrows()
+{
+	glDisable(GL_LIGHTING);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	if (ReviewLesson >= 0)
+	{
+		const MoveReview& r = Report.moves[Report.lessons[ReviewLesson]];
+		DrawArrow(r.played.from, r.played.to, 0.95f, 0.25f, 0.2f);
+		if (ReviewReveal)
+			DrawArrow(r.best.from, r.best.to, 0.25f, 0.9f, 0.35f);
+	}
+	else if (ReplayIndex >= 0 && ReplayPos > 0)
+	{
+		// a replay's last move gets an arrow when it's marked: green for strong, red for a mistake
+		const Move& m = ReplayMoves[ReplayPos - 1];
+		char mark = ReplayMarks[ReplayPos - 1];
+		if (mark == '!')
+			DrawArrow(m.from, m.to, 0.25f, 0.9f, 0.35f);
+		else if (mark == '?')
+			DrawArrow(m.from, m.to, 0.95f, 0.25f, 0.2f);
+	}
+	glEnable(GL_DEPTH_TEST);
 }
 
 // one pixel-font character centered on a world position (always faces the screen)
@@ -1615,6 +2021,18 @@ void HudText(float x, float y, const std::string& s, float r, float g, float b)
 	DoRasterString(x, y, 0.f, (char*)s.c_str());
 }
 
+// the dark strip along the bottom behind review/replay text: four lines, as slim as it can be
+void BottomPanel()
+{
+	glColor4f(0.f, 0.f, 0.f, 0.72f);
+	glBegin(GL_QUADS);
+	glVertex2f(0.f, 0.f);
+	glVertex2f(100.f, 0.f);
+	glVertex2f(100.f, 13.5f);
+	glVertex2f(0.f, 13.5f);
+	glEnd();
+}
+
 void DrawHud()
 {
 	glDisable(GL_DEPTH_TEST);
@@ -1663,14 +2081,80 @@ void DrawHud()
 		line = Name(ResignedSide) + " RESIGNED - " + Wins(ResignedSide ^ 1) + "   [N] NEW GAME";
 		r = 1.f; g = 0.85f; b = 0.1f;
 	}
+	if (ReviewLesson >= 0)
+	{
+		char buf[64];
+		sprintf(buf, "REVIEWING MISTAKE %d OF %d", ReviewLesson + 1, (int)Report.lessons.size());
+		line = buf;
+		r = 0.6f; g = 0.9f; b = 1.f;
+	}
+
+	// watching a stored game: its title up top, the commentary along the bottom
+	if (ReplayIndex >= 0)
+	{
+		const ReplayGame& game = Replays()[ReplayIndex];
+		HudText(2.f, 96.f, std::string("WATCHING: ") + game.title, 0.6f, 0.9f, 1.f);
+		HudText(2.f, 92.5f, game.subtitle, 0.85f, 0.85f, 0.85f);
+
+		BottomPanel();
+		char buf[160];
+		if (ReplayPos == 0)
+		{
+			HudText(2.f, 10.5f, "BEFORE THE FIRST MOVE", 1.f, 0.85f, 0.1f);
+			HudText(2.f, 7.5f, game.intro, 0.9f, 0.9f, 0.9f);
+		}
+		else
+		{
+			int ply = ReplayPos - 1;
+			char mark = ReplayMarks[ply];
+			// move numbers: plies 0,1 are move 1 (white, black), and so on (the stored games start with white)
+			sprintf(buf, "MOVE %d%s %s%s", ply / 2 + 1, (ply % 2 == 0) ? "." : "...", LastMoveText.c_str(),
+				mark == '!' ? "  (STRONG)" : mark == '?' ? "  (MISTAKE)" : "");
+			float cr = mark == '!' ? 0.4f : mark == '?' ? 1.f : 1.f;
+			float cg = mark == '!' ? 1.f : mark == '?' ? 0.4f : 0.85f;
+			float cb = mark == '!' ? 0.5f : mark == '?' ? 0.35f : 0.1f;
+			HudText(2.f, 10.5f, buf, cr, cg, cb);
+			HudText(2.f, 7.5f, game.plies[ply].comment, 0.9f, 0.9f, 0.9f);
+		}
+		if (ReplayPos == (int)ReplayMoves.size())
+			HudText(2.f, 4.5f, game.result, 1.f, 0.85f, 0.1f);
+		sprintf(buf, "[<] BACK  [>] NEXT  [SPACE] %s  [ESC] EXIT      %d/%d", ReplayAuto ? "PAUSE" : "AUTO-PLAY",
+			ReplayPos, (int)ReplayMoves.size());
+		HudText(2.f, 1.5f, buf, 0.75f, 0.75f, 0.75f);
+		return;
+	}
+
 	HudText(2.f, 96.f, line, r, g, b);
 
 	// the bot's level, in US Chess terms, and yours:
 	if (bot)
 	{
 		char buf[96];
-		sprintf(buf, "BOT %d %s   YOU %d %s", BotElo, RatingClass(BotElo), Player.rating, RatingClass(Player.rating));
-		HudText(2.f, 92.5f, buf, 0.6f, 0.9f, 1.f);
+		sprintf(buf, "BOT %d %s   YOU %d %s%s", BotElo, RatingClass(BotElo), Player.rating, RatingClass(Player.rating),
+			ChallengeGame ? "   CHALLENGE" : "");
+		HudText(2.f, 92.5f, buf, ChallengeGame ? 1.f : 0.6f, ChallengeGame ? 0.7f : 0.9f, ChallengeGame ? 0.3f : 1.f);
+	}
+
+	// the lesson you're looking at, along the bottom:
+	if (ReviewLesson >= 0)
+	{
+		const MoveReview& m = Report.moves[Report.lessons[ReviewLesson]];
+		BottomPanel();
+
+		char buf[160];
+		sprintf(buf, "MOVE %d: YOU PLAYED %s (RED) - %s   %.0f%% -> %.0f%% TO WIN", m.moveNumber, m.playedName.c_str(),
+			VerdictName(m.verdict), m.winBefore, m.winAfter);
+		HudText(2.f, 10.5f, buf, 1.f, 0.4f, 0.35f);
+		HudText(2.f, 7.5f, LessonCause(m), 0.9f, 0.9f, 0.9f);
+		if (ReviewReveal)
+		{
+			sprintf(buf, "BETTER WAS %s (GREEN)", m.bestName.c_str());
+			HudText(2.f, 4.5f, buf, 0.4f, 1.f, 0.5f);
+		}
+		else
+			HudText(2.f, 4.5f, "CAN YOU FIND A BETTER MOVE?   [H] SHOW IT", 1.f, 0.85f, 0.1f);
+		HudText(2.f, 1.5f, "[<] [>] OTHER MISTAKES   [A] OR [ESC] BACK TO THE GAME", 0.75f, 0.75f, 0.75f);
+		return;
 	}
 
 	float y = bot ? 89.f : 92.5f;
@@ -1683,6 +2167,30 @@ void DrawHud()
 	if (!RatingNote.empty())
 	{
 		HudText(2.f, y, RatingNote, 1.f, 0.85f, 0.1f);
+		y -= 3.5f;
+	}
+
+	// after a computer game: analysis progress, then the accuracy summary
+	if (Analyzing)
+	{
+		char buf[64];
+		sprintf(buf, "ANALYZING YOUR GAME... %d/%d", AnalysisProgress.load(), AnalysisTotal);
+		HudText(2.f, y, buf, 0.6f, 0.9f, 1.f);
+		y -= 3.5f;
+	}
+	else if (Report.valid)
+	{
+		char buf[128];
+		sprintf(buf, "ACCURACY %.0f%%   %d BLUNDER%s  %d MISTAKE%s  %d INACCURAC%s", Report.accuracy,
+			Report.counts[VERDICT_BLUNDER], Report.counts[VERDICT_BLUNDER] == 1 ? "" : "S",
+			Report.counts[VERDICT_MISTAKE], Report.counts[VERDICT_MISTAKE] == 1 ? "" : "S",
+			Report.counts[VERDICT_INACCURACY], Report.counts[VERDICT_INACCURACY] == 1 ? "Y" : "IES");
+		HudText(2.f, y, buf, 0.6f, 0.9f, 1.f);
+		y -= 3.5f;
+		if (!Report.lessons.empty())
+			HudText(2.f, y, "[A] SEE YOUR MISTAKES AND THE BETTER MOVES", 1.f, 0.85f, 0.1f);
+		else
+			HudText(2.f, y, "NO REAL MISTAKES - NICE GAME!", 0.4f, 1.f, 0.5f);
 		y -= 3.5f;
 	}
 
@@ -1713,10 +2221,11 @@ void DrawHud()
 	if (Frozen)
 		HudText(2.f, y, "ANIMATION FROZEN [F]", 0.6f, 0.9f, 1.f);
 
-	if (IsTimed())
-		HudText(2.f, 2.f, "[N]EW [P]AUSE [V]IEW  SHIFT+DRAG/ARROWS ORBIT  WHEEL ZOOM", 0.75f, 0.75f, 0.75f);
-	else
-		HudText(2.f, 2.f, "[N]EW [U]NDO [V]IEW  SHIFT+DRAG/ARROWS ORBIT  WHEEL ZOOM", 0.75f, 0.75f, 0.75f);
+	std::string help = IsTimed() ? "[N]EW [P]AUSE" : "[N]EW [U]NDO";
+	if (bot)
+		help += " [C]HALLENGE";
+	help += " [V]IEW  SHIFT+DRAG/ARROWS ORBIT  WHEEL ZOOM";
+	HudText(2.f, 2.f, help, 0.75f, 0.75f, 0.75f);
 }
 
 // draw the complete scene:
@@ -1739,6 +2248,19 @@ Display( )
 	glMatrixMode(GL_PROJECTION);
 	glLoadMatrixf(glm::value_ptr(ProjMatrix));
 	glMatrixMode(GL_MODELVIEW);
+
+	// a soft fill light from over your shoulder, set in eye space (identity modelview) so it
+	// follows the camera -- whatever side you orbit to, the pieces' facets stay readable:
+	glLoadIdentity();
+	const GLfloat fillDir[4] = { 0.3f, 0.6f, 1.f, 0.f };	// directional (w = 0)
+	const GLfloat fillColor[4] = { 0.35f, 0.35f, 0.35f, 1.f };
+	const GLfloat noColor[4] = { 0.f, 0.f, 0.f, 1.f };
+	glLightfv(GL_LIGHT1, GL_POSITION, fillDir);
+	glLightfv(GL_LIGHT1, GL_DIFFUSE, fillColor);
+	glLightfv(GL_LIGHT1, GL_AMBIENT, noColor);
+	glLightfv(GL_LIGHT1, GL_SPECULAR, noColor);
+	glEnable(GL_LIGHT1);
+
 	glLoadMatrixf(glm::value_ptr(ViewMatrix));
 
 	// set the fog parameters:
@@ -1778,6 +2300,7 @@ Display( )
 	DrawCoordinates();
 	DrawHighlights();
 	DrawPieces();
+	DrawReviewArrows();
 
 	if (DebugOn != 0)
 		DrawDebug();
@@ -1852,11 +2375,16 @@ DoMainMenu( int id )
 			StartNewGame( nullptr );
 			break;
 
+		case CHALLENGE:
+			if( VsComputer( ) )
+				StartNewGame( nullptr, true );
+			break;
+
 		case UNDO:
 		{
 			// no take-backs against the clock, or once a game is over:
 			FinishAnimations( );
-			if( IsTimed( ) || IsGameOver( ) || !Rules.CanUndo( ) )
+			if( IsTimed( ) || IsGameOver( ) || !Rules.CanUndo( ) || ReplayIndex >= 0 || ReviewLesson >= 0 )
 				break;
 			StopBot( );
 			// against the computer, go back to your last turn (its reply too, if it made one):
@@ -1868,6 +2396,8 @@ DoMainMenu( int id )
 				if( DebugOn != 0 )
 					fprintf( stderr, "undo %s\n", LastMoveText.c_str( ) );
 				Rules.UnmakeMove( );
+				if( !GameMoves.empty( ) )
+					GameMoves.pop_back( );
 				RefreshGameState( );
 			}
 			SyncPiecesToBoard( );
@@ -1879,6 +2409,7 @@ DoMainMenu( int id )
 		}
 
 		case RESIGN:
+			ExitReplay( );
 			if( !IsGameOver( ) )
 			{
 				StopBot( );
@@ -2005,6 +2536,14 @@ DoPromoMenu( int id )
 	RefreshOptionMenus( );
 }
 
+void
+DoReplayMenu( int id )
+{
+	StartReplay( id );
+	glutSetWindow( MainWindow );
+	glutPostRedisplay( );
+}
+
 // switching opponent or color starts a new game:
 void
 DoOpponentMenu( int id )
@@ -2119,9 +2658,18 @@ InitMenus( )
 	glutAddSubMenu( "Auto-Flip Board", FlipMenu );
 	glutAddSubMenu( "Promotion",       PromoMenu );
 
+	ReplayMenu = glutCreateMenu( DoReplayMenu );
+	for( int i = 0; i < (int)Replays( ).size( ); i++ )
+	{
+		std::string label = std::string( Replays( )[i].title ) + " - " + Replays( )[i].subtitle;
+		glutAddMenuEntry( label.c_str( ), i );
+	}
+
 	int mainmenu = glutCreateMenu( DoMainMenu );
 	glutAddMenuEntry( "New Game",      NEW_GAME );
+	glutAddSubMenu(   "Watch a Game",  ReplayMenu );
 	glutAddMenuEntry( "Undo Move",     UNDO );
+	glutAddMenuEntry( "Challenge Game (bot +250)", CHALLENGE );
 	glutAddMenuEntry( "Resign",        RESIGN );
 	glutAddSubMenu(   "Game Options",  optionsmenu );
 	glutAddSubMenu(   "View",          viewmenu );
@@ -2221,9 +2769,12 @@ InitLists( )
 	glVertex3f( edge, -0.1f, -edge);
 	for (int sq = 0; sq < 64; sq++)
 	{
+		// wood tones: dark squares light enough that the charcoal pieces stand out on them
 		bool light = (FileOf(sq) + RankOf(sq)) % 2 == 1;	// a1 is dark
-		float c = light ? 1.0f : 0.1f;
-		glColor3f(c, c, c);
+		if (light)
+			glColor3f(0.87f, 0.79f, 0.62f);
+		else
+			glColor3f(0.45f, 0.30f, 0.19f);
 		glm::vec3 p = SquareCenter(sq);
 		float h = 0.5f * TILE;
 		glVertex3f(p.x - h, 0.f, p.z - h);
@@ -2270,8 +2821,68 @@ Keyboard( unsigned char c, int x, int y )
 		return;
 	}
 
+	// watching a stored game: Esc leaves, Space plays it through; keys that would touch your
+	// set-aside game (review, hints, pause, undo, challenge) wait until you're back
+	if( ReplayIndex >= 0 )
+	{
+		bool handled = true;
+		switch( c )
+		{
+			case ESCAPE:	ExitReplay( );			break;
+			case ' ':		ToggleReplayAuto( );	break;
+			case 'a': case 'A': case 'h': case 'H': case 'p': case 'P':
+			case 'u': case 'U': case 'c': case 'C':
+				break;
+			default:
+				handled = false;
+		}
+		if( handled )
+		{
+			glutSetWindow( MainWindow );
+			glutPostRedisplay( );
+			return;
+		}
+	}
+
+	// Esc closes a review before it would ever quit:
+	if( c == ESCAPE && ReviewLesson >= 0 )
+	{
+		ExitReview( );
+		glutSetWindow( MainWindow );
+		glutPostRedisplay( );
+		return;
+	}
+
 	switch( c )
 	{
+		case 'a':
+		case 'A':
+			// open/close the review of your mistakes (once a computer game has been analysed)
+			if( ReviewLesson >= 0 )
+				ExitReview( );
+			else if( Report.valid && !Report.lessons.empty( ) )
+				ShowLesson( 0 );
+			break;
+
+		case 'c':
+		case 'C':
+			DoMainMenu( CHALLENGE );
+			break;
+
+		case 'h':
+		case 'H':
+			// reviewing: show/hide the better move; playing: move hints on/off
+			if( ReviewLesson >= 0 )
+			{
+				ReviewReveal = !ReviewReveal;
+				if( ReviewReveal && DebugOn != 0 )
+					fprintf( stderr, "review: showing the better move %s\n",
+						Report.moves[Report.lessons[ReviewLesson]].bestName.c_str( ) );
+			}
+			else
+				DoHintsMenu( ShowHints ? 0 : 1 );
+			break;
+
 		case 'p':
 		case 'P':
 			if( IsTimed( ) && !IsGameOver( ) )
@@ -2367,6 +2978,26 @@ Keyboard( unsigned char c, int x, int y )
 void
 SpecialKeys( int key, int x, int y )
 {
+	// while watching a game, left/right step through its moves instead of orbiting
+	if( ReplayIndex >= 0 && ( key == GLUT_KEY_LEFT || key == GLUT_KEY_RIGHT ) )
+	{
+		ReplayAuto = false;		// stepping by hand takes over from auto-play
+		ReplayGeneration++;
+		ReplayStep( key == GLUT_KEY_RIGHT ? 1 : -1 );
+		glutSetWindow( MainWindow );
+		glutPostRedisplay( );
+		return;
+	}
+
+	// while reviewing, left/right step through your mistakes instead of orbiting
+	if( ReviewLesson >= 0 && ( key == GLUT_KEY_LEFT || key == GLUT_KEY_RIGHT ) )
+	{
+		ShowLesson( ReviewLesson + ( key == GLUT_KEY_RIGHT ? 1 : -1 ) );
+		glutSetWindow( MainWindow );
+		glutPostRedisplay( );
+		return;
+	}
+
 	switch( key )
 	{
 		case GLUT_KEY_LEFT:		CamYaw -= ORBIT_KEY_STEP;	break;

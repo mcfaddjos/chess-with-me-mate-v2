@@ -21,7 +21,8 @@
       Forbid      log lines that must not appear
     Every case gets its own throwaway rating profile, so your real one is never touched.
 #>
-param([Parameter(Mandatory)][string]$Exe, [string]$OutDir = (Join-Path $PSScriptRoot 'build\ui'))
+param([Parameter(Mandatory)][string]$Exe, [string]$OutDir = (Join-Path $PSScriptRoot 'build\ui'),
+      [string]$Only = '')     # run just the cases whose names match this wildcard, e.g. 'review*'
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -166,6 +167,8 @@ $cases = @(
     # --- options ---
     @{ Name = 'hints-off-still-moves'; GameArgs = '-nohints'; Squares = 'e2 e4'
        Expect = , 'e2-e4' },
+    @{ Name = 'hints-on'; GameArgs = '-hints'; Squares = 'e2'
+       Expect = , 'click e2' },
     @{ Name = 'auto-flip'; GameArgs = '-autoflip'; Squares = 'e2 e4'
        Expect = 'e2-e4', 'view: black side' },
 
@@ -185,13 +188,45 @@ $cases = @(
     @{ Name = 'bot-undo-takes-back-both'; GameArgs = '-bot -color white -botelo 1000 -seed 7'; Squares = 'e2 e4 wait:3'; Keys = 'u'
        Expect = 'e2-e4', '~^bot: ', '~^undo ', 'undo e2-e4' },
     @{ Name = 'bot-leaving-counts-as-loss'; GameArgs = '-bot -color white -botelo 1000 -seed 7'; Squares = 'e2 e4 wait:3 d2 d3 wait:3'; Keys = 'n'
-       Expect = 'e2-e4', '~^bot: ', 'd2-d3', 'left an unfinished game: counted as resigning', 'result: loss, RATING 1000 -> 980 (-20)' }
+       Expect = 'e2-e4', '~^bot: ', 'd2-d3', 'left an unfinished game: counted as resigning', 'result: loss, RATING 1000 -> 980 (-20)' },
+    @{ Name = 'challenge-game'; GameArgs = '-bot -color white'; Keys = 'c'
+       Expect = '~vs bot 1050, you play white', '~vs bot 1250 \(challenge\), you play white' },
+
+    # --- post-game review: fool's mate -- after 1.f3 e5 you play g4??, the bot mates with Qh4#,
+    #     then A opens the review of that blunder ---
+    @{ Name = 'review-after-a-blunder'; GameArgs = '-bot -color white -botelo 2200 -seed 1 -fen "rnbqkbnr/pppp1ppp/8/4p3/8/5P2/PPPPP1PP/RNBQKBNR w KQkq - 0 2"'
+       Squares = 'g2 g4 wait:6'; Keys = 'a'
+       Expect = 'g2-g4', 'bot: Qd8-h4#', '~^result: loss', '~^analysis: accuracy', '~analysed move 2 g2-g4: .*BLUNDER$',
+                '~^review 1/1: move 2, played g2-g4 \(BLUNDER\), better .*, IT ALLOWED Qd8-h4'
+       Forbid = , 'review: showing the better move e2-e4' },
+    # --- watching stored games ---
+    @{ Name = 'replay-lasker-trap'; GameArgs = '-replay 0'; Keys = '{RIGHT 20}'; Wait = 1
+       Expect = 'replay: LASKER TRAP', 'replay move 12: e3xf2+', 'replay move 14: f2xg1=N+', 'replay move 16: Bc8-g4+', 'replay move 20: Nb8-c6' },
+    @{ Name = 'replay-back-and-exit'; GameArgs = '-replay 2'; Keys = '{RIGHT 4}{LEFT}{ESC}'
+       Expect = "replay: FOOL'S MATE", 'replay move 4: Qd8-h4#', 'replay back to move 3', 'replay closed' },
+    @{ Name = 'replay-ignores-board-clicks'; GameArgs = '-replay 1'; Squares = 'e2 e4'
+       Expect = , 'replay: YOUR OPENING: THE LOOSE BISHOP'; Forbid = , 'e2-e4' },
+
+    # ...and the better move only appears once you ask for it with H
+    @{ Name = 'review-reveal-with-h'; GameArgs = '-bot -color white -botelo 2200 -seed 1 -fen "rnbqkbnr/pppp1ppp/8/4p3/8/5P2/PPPPP1PP/RNBQKBNR w KQkq - 0 2"'
+       Squares = 'g2 g4 wait:6'; Keys = 'ah'
+       Expect = 'bot: Qd8-h4#', '~^review 1/1: ', '~^review: showing the better move ' }
 )
 
+if ($Only) {
+    $cases = @($cases | Where-Object { $_['Name'] -like $Only })
+    if ($cases.Count -eq 0) { Write-Host "No UI test matches '$Only'"; exit 1 }
+}
+
 $failed = 0
-$summary = @("UI test run $(Get-Date -Format s)  exe: $Exe")
+$summary = @("UI test run $(Get-Date -Format s)  exe: $Exe$(if ($Only) { "  only: $Only" })")
 Write-Host "== UI tests ($Exe)"
+Write-Host "   $($cases.Count) cases, about 2 minutes. Hands off the mouse and keyboard -- and don't click in"
+Write-Host "   this console: clicking selects text, which pauses PowerShell until you press Esc."
+$n = 0
 foreach ($c in $cases) {
+    $n++
+    Write-Host ("     [{0}/{1}] {2}..." -f $n, $cases.Count, $c['Name'])
     try {
         Invoke-Case $c
         $line = "ok   {0}" -f $c['Name']

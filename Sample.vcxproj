@@ -140,6 +140,7 @@
   <ItemGroup>
     <ClInclude Include="chessrules.h" />
     <ClInclude Include="engine.h" />
+    <ClInclude Include="replays.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

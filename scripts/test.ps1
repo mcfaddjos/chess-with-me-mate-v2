@@ -8,7 +8,8 @@
     .\scripts\test.ps1
     .\scripts\test.ps1 -UI
 #>
-param([switch]$UI, [ValidateSet('Release', 'Debug')][string]$Configuration = 'Release')
+param([switch]$UI, [ValidateSet('Release', 'Debug')][string]$Configuration = 'Release',
+      [string]$Only = '')    # with -UI: only the UI cases matching this wildcard, e.g. -Only 'review*'
 
 . "$PSScriptRoot\common.ps1"
 
@@ -30,7 +31,7 @@ try {
 finally { Pop-Location }
 
 if ($UI) {
-    & (Join-Path $RepoRoot 'tests\ui_tests.ps1') -Exe (Join-Path $RepoRoot "$Configuration\Sample.exe")
+    & (Join-Path $RepoRoot 'tests\ui_tests.ps1') -Exe (Join-Path $RepoRoot "$Configuration\Sample.exe") -Only $Only
     if ($LASTEXITCODE -ne 0) { throw 'UI tests failed' }
 }
 

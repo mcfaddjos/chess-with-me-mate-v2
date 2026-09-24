@@ -29,6 +29,7 @@ const int RATING_MIN = 100;
 const int RATING_MAX = 2600;
 const int RATING_START = 1000;		// "medium-low": US Chess Class E, a solid beginner
 const int BOT_STRETCH = 50;		// the next bot is rated this much above you
+const int CHALLENGE_STRETCH = 250;	// ...or this much, in a challenge game
 
 // US Chess rating classes
 inline const char* RatingClass(int elo)
@@ -63,9 +64,10 @@ inline int AdjustRating(int player, int opponent, double score, int gamesPlayed)
 	return std::max(RATING_MIN, std::min(RATING_MAX, next));
 }
 
-inline int BotRatingFor(int playerRating)
+inline int BotRatingFor(int playerRating, bool challenge = false)
 {
-	return std::max(RATING_MIN, std::min(RATING_MAX, playerRating + BOT_STRETCH));
+	int stretch = challenge ? CHALLENGE_STRETCH : BOT_STRETCH;
+	return std::max(RATING_MIN, std::min(RATING_MAX, playerRating + stretch));
 }
 
 struct BotLevel
@@ -207,17 +209,95 @@ public:
 
 	long long Nodes() const { return nodes; }
 
+	// The engine's honest best move (no temperature), iterative deepening up to maxDepth within
+	// 'seconds'. Returns the score for the side to move; depthUsed is the last completed depth.
+	// Depths up to minDepth always finish (only 'stop' can cut them short) so the result never
+	// depends on how busy the machine is -- a time budget only limits the extra depth beyond it.
+	int SearchBest(ChessRules& pos, int maxDepth, double seconds, std::atomic<bool>& stop, Move& best, int& depthUsed,
+		int minDepth = 1)
+	{
+		Begin(stop, seconds);
+		std::vector<Move> moves;
+		pos.GenerateLegal(moves);
+		best = Move();
+		depthUsed = 0;
+		if (moves.empty())
+			return pos.InCheck(pos.side) ? -MATE : 0;
+		OrderMoves(pos, moves);
+
+		int bestScore = -INF;
+		for (int depth = 1; depth <= maxDepth; depth++)
+		{
+			enforceDeadline = depth > minDepth;
+			int alpha = -INF, iterScore = -INF;
+			size_t iterBest = 0;
+			bool complete = true;
+			for (size_t i = 0; i < moves.size(); i++)
+			{
+				pos.MakeMove(moves[i]);
+				int s = -Search(pos, depth - 1, -INF, -alpha, 1);
+				pos.UnmakeMove();
+				if (aborted)
+				{
+					complete = false;
+					break;
+				}
+				if (s > iterScore)
+				{
+					iterScore = s;
+					iterBest = i;
+				}
+				alpha = std::max(alpha, s);
+			}
+			if (!complete)
+				break;
+			best = moves[iterBest];
+			bestScore = iterScore;
+			depthUsed = depth;
+			std::rotate(moves.begin(), moves.begin() + iterBest, moves.begin() + iterBest + 1);	// best first next time
+		}
+		if (depthUsed == 0)		// ran out of time before even depth 1 finished
+		{
+			best = moves[0];
+			depthUsed = 1;
+			bestScore = ScoreMove(pos, best, 1, stop);
+		}
+		return bestScore;
+	}
+
+	// score of playing m here, for the side to move, searched to 'depth' (no time limit beyond 'stop')
+	int ScoreMove(ChessRules& pos, const Move& m, int depth, std::atomic<bool>& stop)
+	{
+		Begin(stop, 60.0);
+		pos.MakeMove(m);
+		int s = -Search(pos, depth - 1, -INF, INF, 1);
+		pos.UnmakeMove();
+		return s;
+	}
+
 private:
+	void Begin(std::atomic<bool>& stop, double seconds)
+	{
+		stopFlag = &stop;
+		aborted = false;
+		enforceDeadline = true;
+		useQuiescence = true;
+		nodes = 0;
+		deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds((int)(seconds * 1000));
+	}
+
 	std::atomic<bool>* stopFlag = nullptr;
 	std::chrono::steady_clock::time_point deadline;
 	bool aborted = false;
 	bool useQuiescence = true;
 	long long nodes = 0;
 
+	bool enforceDeadline = true;	// false while SearchBest is still inside its guaranteed minimum depth
+
 	bool OutOfTime()
 	{
 		if ((nodes & 1023) == 0)
-			if (stopFlag->load() || std::chrono::steady_clock::now() > deadline)
+			if (stopFlag->load() || (enforceDeadline && std::chrono::steady_clock::now() > deadline))
 				aborted = true;
 		return aborted;
 	}
@@ -396,5 +476,179 @@ private:
 		-30,-30,  0,  0,  0,  0,-30,-30,
 		-50,-30,-30,-30,-30,-30,-30,-50 };
 };
+
+// ---------------------------------------------------------------- post-game analysis
+
+// Accuracy follows lichess's published method: a score becomes a winning chance, and each
+// move's accuracy comes from how much winning chance it gave away versus the engine's best.
+// Verdicts use lichess's thresholds on that same drop (10% / 20% / 30%).
+
+enum MoveVerdict
+{
+	VERDICT_BEST,
+	VERDICT_GOOD,
+	VERDICT_INACCURACY,
+	VERDICT_MISTAKE,
+	VERDICT_BLUNDER
+};
+
+inline const char* VerdictName(int v)
+{
+	static const char* names[] = { "BEST", "GOOD", "INACCURACY", "MISTAKE", "BLUNDER" };
+	return names[std::max(0, std::min(4, v))];
+}
+
+// chance of winning (0-100) for the side with this centipawn score
+inline double WinChance(int cp)
+{
+	cp = std::max(-1500, std::min(1500, cp));	// mate scores count as "totally winning"
+	return 50.0 + 50.0 * (2.0 / (1.0 + std::exp(-0.00368208 * cp)) - 1.0);
+}
+
+inline double MoveAccuracy(double winBefore, double winAfter)
+{
+	double a = 103.1668 * std::exp(-0.04354 * std::max(0.0, winBefore - winAfter)) - 3.1669;
+	return std::max(0.0, std::min(100.0, a));
+}
+
+struct MoveReview
+{
+	int ply = 0;			// index of this move in the game
+	int moveNumber = 0;		// chess move number: 1, 2, 3...
+	Move played, best, reply;	// reply = the opponent's best answer to the move you played
+	std::string playedName, bestName, replyName;
+	int bestScore = 0, playedScore = 0;	// centipawns, from your side
+	double winBefore = 50, winAfter = 50;	// winning chances %, from your side
+	double accuracy = 100;
+	int verdict = VERDICT_BEST;
+	int depth = 0;			// how many moves ahead the analysis looked
+	int missedCapture = NO_PIECE;	// the piece the better move would have won, if that's what you missed
+	bool replyPunishes = false;		// the reply to your move captures or checks
+};
+
+// why the move was a mistake, in words -- without giving away the better move itself:
+// either you missed winning something, or your move handed the opponent a strong reply
+inline std::string LessonCause(const MoveReview& r)
+{
+	static const char* names[7] = { "", "PAWN", "KNIGHT", "BISHOP", "ROOK", "QUEEN", "KING" };
+	if (r.missedCapture != NO_PIECE)
+		return std::string("YOU MISSED A CHANCE TO WIN A ") + names[r.missedCapture];
+	if (!r.replyName.empty())
+		return std::string(r.replyPunishes ? "IT ALLOWED " : "THE BOT'S BEST REPLY WAS ") + r.replyName;
+	return "";
+}
+
+struct GameReport
+{
+	bool valid = false;
+	double accuracy = 0;			// average over your moves
+	int counts[5] = { 0, 0, 0, 0, 0 };	// by MoveVerdict
+	std::vector<MoveReview> moves;		// every move by the side analysed
+	std::vector<int> lessons;		// indexes into moves: your worst moves (up to 5), in game order
+};
+
+inline bool SameMove(const Move& a, const Move& b)
+{
+	return a.from == b.from && a.to == b.to && a.promo == b.promo;
+}
+
+// Replays a finished game and reviews every move 'side' made. 'progress' counts reviewed moves.
+inline GameReport AnalyzeGame(const ChessRules& start, const std::vector<Move>& moves, int side,
+	std::atomic<bool>& stop, std::atomic<int>& progress, double secondsPerMove = 0.35, int maxDepth = 4)
+{
+	GameReport report;
+	ChessRules pos = start;
+	Engine engine;
+
+	for (size_t i = 0; i < moves.size(); i++)
+	{
+		if (stop.load())
+			return report;		// valid stays false
+		const Move& m = moves[i];
+		if (pos.side == side)
+		{
+			MoveReview r;
+			r.ply = (int)i;
+			r.moveNumber = pos.fullmove;
+			r.played = m;
+			r.playedName = pos.MoveName(m);
+
+			int depth;
+			r.bestScore = engine.SearchBest(pos, maxDepth, secondsPerMove, stop, r.best, depth, 3);	// always look 3 ahead
+			r.depth = depth;
+			r.bestName = pos.MoveName(r.best);
+			r.playedScore = SameMove(m, r.best) ? r.bestScore : engine.ScoreMove(pos, m, depth, stop);
+			r.playedScore = std::min(r.playedScore, r.bestScore);	// the best move is the yardstick
+
+			// did the better move win material that yours didn't?
+			static const int worth[7] = { 0, 1, 3, 3, 5, 9, 0 };
+			auto captured = [&pos](const Move& mv) -> int {
+				if (!(mv.flags & MF_CAPTURE))
+					return NO_PIECE;
+				return (mv.flags & MF_ENPASSANT) ? (int)PAWN : TypeOf(pos.board[mv.to]);
+			};
+			int bestTakes = captured(r.best), playedTakes = captured(m);
+			if (!SameMove(m, r.best) && bestTakes != NO_PIECE && worth[bestTakes] > worth[playedTakes] &&
+				r.bestScore - r.playedScore >= 100)
+				r.missedCapture = bestTakes;
+
+			// what did the move allow?
+			pos.MakeMove(m);
+			std::vector<Move> replies;
+			pos.GenerateLegal(replies);
+			if (!replies.empty())
+			{
+				int d2;
+				engine.SearchBest(pos, std::max(1, depth - 1), secondsPerMove / 2, stop, r.reply, d2);
+				r.replyName = pos.MoveName(r.reply);
+				int replier = pos.side;
+				pos.MakeMove(r.reply);
+				r.replyPunishes = (r.reply.flags & MF_CAPTURE) || pos.InCheck(replier ^ 1);
+				pos.UnmakeMove();
+			}
+			pos.UnmakeMove();
+
+			r.winBefore = WinChance(r.bestScore);
+			r.winAfter = WinChance(r.playedScore);
+			r.accuracy = MoveAccuracy(r.winBefore, r.winAfter);
+			double drop = r.winBefore - r.winAfter;
+			if (SameMove(m, r.best) || drop < 2.0)	r.verdict = VERDICT_BEST;
+			else if (drop < 10.0)			r.verdict = VERDICT_GOOD;
+			else if (drop < 20.0)			r.verdict = VERDICT_INACCURACY;
+			else if (drop < 30.0)			r.verdict = VERDICT_MISTAKE;
+			else					r.verdict = VERDICT_BLUNDER;
+
+			report.moves.push_back(r);
+			report.counts[r.verdict]++;
+			progress++;
+		}
+		pos.MakeMove(m);
+	}
+
+	if (stop.load())
+		return report;
+
+	double total = 0;
+	for (const MoveReview& r : report.moves)
+		total += r.accuracy;
+	report.accuracy = report.moves.empty() ? 100.0 : total / report.moves.size();
+
+	// the lessons: your five costliest moves (inaccuracy or worse), shown in the order you played them
+	std::vector<int> bad;
+	for (size_t i = 0; i < report.moves.size(); i++)
+		if (report.moves[i].verdict >= VERDICT_INACCURACY)
+			bad.push_back((int)i);
+	std::stable_sort(bad.begin(), bad.end(), [&](int a, int b) {
+		const MoveReview& x = report.moves[a];
+		const MoveReview& y = report.moves[b];
+		return (x.winBefore - x.winAfter) > (y.winBefore - y.winAfter);
+	});
+	if (bad.size() > 5)
+		bad.resize(5);
+	std::sort(bad.begin(), bad.end());
+	report.lessons = bad;
+	report.valid = true;
+	return report;
+}
 
 #endif	// ENGINE_H

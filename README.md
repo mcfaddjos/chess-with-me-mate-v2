@@ -19,7 +19,7 @@ v2 keeps the low-poly, flat-shaded, pixel-font look, but plays real chess: full 
   - Opponent: the computer (default) or two players on one screen
   - Your color against the computer: alternate (default), White, or Black
   - Time control: untimed, 1+0, 3+2, 5+0, 10+0, 15+10, or 30+0
-  - Move hints on or off
+  - Move hints (legal-move markers): **off by default** so you find the moves yourself; `H` toggles them
   - Auto-flip the board to face whoever is moving (two-player games)
   - Always promote to a queen, or choose the piece
 
@@ -39,6 +39,36 @@ How the bot's rating turns into play ([`engine.h`](engine.h)):
 
 The rating labels are approximate. The bot is tuned by feel, not calibrated against rated human players. That's why the adaptive loop matters more than the exact number.
 
+**Challenge games** (`C`, or the menu): the bot is rated **+250** above you instead of +50, and the rating line is marked `CHALLENGE`. Elo already rewards the risk: beating a stronger bot gains more, and losing to one costs less.
+
+### Accuracy and learning from your mistakes
+
+After every game against the computer, the engine reviews each of your moves in the background (`ANALYZING YOUR GAME... 12/30`), then shows a summary like `ACCURACY 74%   1 BLUNDER  2 MISTAKES  3 INACCURACIES`.
+
+- **Accuracy** uses the same method as lichess. Each position's score becomes a winning chance, and every move is judged by how much winning chance it gave away compared with the engine's best move. 100% means you always matched it.
+- **Labels** use lichess's thresholds on that drop: 10% or more is an inaccuracy, 20% a mistake, 30% a blunder.
+- **Press `A`** to step through your costliest moves (up to five), in the order you played them:
+  - The board goes back to the position just before the mistake.
+  - A red arrow shows the move you played.
+  - The text explains what went wrong: `MOVE 2: YOU PLAYED g2-g4 (RED) - BLUNDER   44% -> 0% TO WIN`, then *why*: either `IT ALLOWED Qd8-h4` (your move handed the bot a capture or check) or `YOU MISSED A CHANCE TO WIN A BISHOP` (the better move won material).
+  - **The better move stays hidden** so you can look for it yourself. Press `H` to show it: a green arrow and `BETTER WAS e2-e4 (GREEN)`.
+  - `←` and `→` move between mistakes (the answer hides again for each one), and `A` or `Esc` returns to the final position.
+
+The analysis doesn't affect your rating. It's there to show you what to do differently.
+
+### Watching games
+
+Right-click → **Watch a Game** plays a stored game on your board, move by move, with commentary along the bottom. `→` plays the next move, `←` goes back, `Space` auto-plays, and `Esc` returns you to your own game exactly as you left it (its clock is paused while you watch). Strong moves get a green arrow and mistakes a red one.
+
+| Game | What it teaches |
+| --- | --- |
+| Lasker Trap (Albin Countergambit), Black wins | Why an early e3 can open lines to your own king, plus a knight underpromotion |
+| Your opening: the loose bishop (1.d4 d5 2.e3 Bg4? 3.Qxg4) | Always check whether anything of theirs is unprotected |
+| Fool's Mate, Black wins | The fastest checkmate: two weakening pawn moves |
+| Scholar's Mate, White wins | Queen and bishop against f7, and how to defend it |
+
+The games live in [`replays.h`](replays.h) as plain move lists with a comment per move. Add your own there; the engine tests replay every stored game through the rules, so a typo fails the tests instead of showing a wrong game.
+
 **Rules for rated games:**
 - Resign from the menu. Starting a new game after you've played a couple of moves also counts as resigning.
 - Undo is allowed while you're learning. Against the computer it takes back your move and the bot's reply. It's disabled once the game is over or in timed games.
@@ -53,6 +83,9 @@ The rating labels are approximate. The bot is tuned by feel, not calibrated agai
 | Wheel, or `+` / `-` | Zoom |
 | Right-click | Menu: new game, undo, resign, game options, view, projection, debug |
 | `N` / `U` | New game / undo (undo is off in timed games and after a game ends) |
+| `C` | Challenge game: a bot rated 250 above you |
+| `A` | After a computer game: review your mistakes (`←` `→` to step, `A` / `Esc` to close) |
+| `H` | While reviewing: show the better move. While playing: move hints on/off |
 | `P` | Pause the clock (timed games) |
 | `1`–`4` | Choose a promotion piece (when "Choose" is on) |
 | `V` | Flip the board |
@@ -74,7 +107,8 @@ Command line options (mostly for testing):
 | `-botelo <n>` / `-seed <n>` | Fix the bot's rating / make its moves repeatable |
 | `-profile <path>` | Keep the rating somewhere else (tests use a throwaway one) |
 | `-cam <yaw>,<pitch>` | Start the camera at this angle |
-| `-choosepromo` `-autoflip` `-nohints` | The matching game options |
+| `-choosepromo` `-autoflip` `-hints` `-nohints` | The matching game options |
+| `-replay <n>` | Start by watching stored game n (0 = Lasker Trap) |
 
 ## Building, testing, and releasing
 
@@ -83,7 +117,7 @@ Requires Visual Studio 2022 with the C++ workload. GLEW, freeglut, and GLM are i
 ```powershell
 .\scripts\build.ps1                      # Release build (-Configuration Debug for Debug)
 .\scripts\test.ps1                       # rules tests (perft, game status) + engine tests (bot, rating math)
-.\scripts\test.ps1 -UI                   # also plays 20 scripted games in a real window (moves your mouse)
+.\scripts\test.ps1 -UI                   # also plays 27 scripted games in a real window (moves your mouse)
 .\scripts\package.ps1 -Version 2.0.0     # build + test + zip into dist\
 ```
 
@@ -98,7 +132,8 @@ To play a packaged build, unzip it and run `ChessWithMeMate.exe`. Keep `pieces\`
 ```
 sample.cpp          The game: rendering, animation, camera, picking, input, menus, clock
 chessrules.h        Chess rules: board, legal move generation, make/unmake, game status
-engine.h            Computer opponent (search, evaluation, strength by rating) and the rating math
+engine.h            Computer opponent (search, evaluation, strength by rating), rating math, post-game analysis
+replays.h           Games to watch (Watch a Game menu), one comment per move
 loadobjfile.cpp     .obj model loader (course-provided, also feeds triangles to picking)
 setlight.cpp        Lighting helpers (course-provided)
 setmaterial.cpp     Material helpers (course-provided)

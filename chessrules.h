@@ -371,6 +371,27 @@ public:
 		halfmove = u.halfmove;
 	}
 
+	// readable name for a move in this position (before it's made), e.g. "Nb1-c3", "e4xd5", "e7-e8=Q", "O-O"
+	std::string MoveName(const Move& m) const
+	{
+		if (m.flags & MF_CASTLE)
+			return (m.to > m.from) ? "O-O" : "O-O-O";
+		const char* letters = " PNBRQK";
+		std::string s;
+		int type = TypeOf(board[m.from]);
+		if (type != PAWN && type != NO_PIECE)
+			s += letters[type];
+		s += SquareName(m.from);
+		s += (m.flags & MF_CAPTURE) ? "x" : "-";
+		s += SquareName(m.to);
+		if (m.flags & MF_PROMOTION)
+		{
+			s += "=";
+			s += letters[m.promo];
+		}
+		return s;
+	}
+
 	bool CanUndo() const		{ return !history.empty(); }
 	int Ply() const			{ return (int)history.size(); }	// moves made since the start/FEN
 	const Move* LastMove() const	{ return history.empty() ? nullptr : &history.back().move; }
